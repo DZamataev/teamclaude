@@ -1,6 +1,7 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity, findUpsertTarget } from './identity.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -427,6 +428,22 @@ export class TUI {
       });
     }
 
+    fields.push({
+      id: 'upstreamProxy',
+      label: 'Upstream proxy',
+      hint: 'Enter to set',
+      value: () => {
+        const { proxy, source } = getUpstreamProxy();
+        if (!proxy) return dim('(direct)');
+        // Name the environment when that is where it came from: a value the
+        // operator did not put in the config, silently in force, is exactly the
+        // thing that is hard to account for later.
+        const via = source.startsWith('env:') ? gray(` (${source.slice(4)})`) : '';
+        return green(describeProxy(proxy)) + via;
+      },
+      enter: () => this._promptInput('Upstream proxy (host:port, or blank for direct)', v => this._doSetUpstreamProxy(v.trim())),
+    });
+
     if (this.sx) {
       fields.push({
         id: 'sxmode',
@@ -656,6 +673,39 @@ export class TUI {
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
     }
+  }
+
+  // ── Network settings ───────────────────────────────
+
+  /**
+   * Set (or clear) the egress proxy live.
+   *
+   * Applied to the running process as well as saved, so the next request uses it
+   * without a restart — the operator is usually here BECAUSE requests are
+   * failing, and "set it, then restart to find out" is a poor loop to be in.
+   * An empty value clears it back to a direct connection; an explicit `false`
+   * survives in the config as "ignore the environment too".
+   */
+  async _doSetUpstreamProxy(value) {
+    let parsed;
+    try {
+      parsed = parseProxyUrl(value);
+    } catch (e) {
+      this._addLog(`Invalid proxy: ${e.message}`);
+      this.mode = 'settings';
+      return;
+    }
+
+    if (parsed) this.config.upstreamProxy = proxyToUrl(parsed);
+    else delete this.config.upstreamProxy;
+
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save proxy setting: ${e.message}`); }
+
+    const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
+    if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else this._addLog('Upstream proxy cleared — connecting directly');
+    this.mode = 'settings';
   }
 
   // ── sx.org settings ────────────────────────────────
@@ -1106,6 +1156,15 @@ export class TUI {
     lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
     lines.push(row(byId('addAccount')));
     if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
+    lines.push('');
+    // ── Network
+    // Drawn before the sx.org block, which returns early when sx is unavailable:
+    // this setting is the one a host behind a corporate proxy needs, and it must
+    // not disappear along with an unrelated integration.
+    lines.push(bold('  Network') + dim('  — how this machine reaches Anthropic'));
+    lines.push(row(byId('upstreamProxy')));
+    lines.push(dim('  Set when the machine has no direct route out (HTTPS_PROXY is'));
+    lines.push(dim('  picked up automatically). Applies to requests, login and refresh.'));
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));

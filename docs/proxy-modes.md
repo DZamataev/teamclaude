@@ -39,6 +39,44 @@ curl --proxy http://localhost:3456 --cacert ~/.config/teamclaude-ca.pem https://
 # → {"teamclaude":"mitm-proxy-ok","host":"www.example.org",...}
 ```
 
+## Upstream proxy
+
+For a host that has **no direct route to the internet** — the corporate case, where
+every outbound connection must go through an HTTP proxy. Without it TeamClaude
+fails with `connect ETIMEDOUT` on the first upstream request, even though Claude
+Code itself works ([#155](https://github.com/KarpelesLab/teamclaude/issues/155)).
+
+```json
+{ "upstreamProxy": "http://user:pass@proxy.corp.example:3128" }
+```
+
+A bare `"proxy.corp.example:3128"` works too. Set it live from the TUI settings
+screen (**Network → Upstream proxy**) — it applies to the next request, without a
+restart.
+
+- Covers **all** Anthropic-bound traffic: request forwarding, OAuth login, token
+  refresh, profile and usage lookups. A proxy that covered only some of them
+  would leave you able to refresh an account but not add one, or the reverse.
+- `HTTPS_PROXY` / `ALL_PROXY` are picked up automatically when the config sets
+  nothing, so a machine already configured for other tools needs no extra setup.
+  When that happens the server says so on startup, and the TUI marks the row with
+  where the value came from — a proxy nobody typed into the config should never be
+  silently in force.
+- `NO_PROXY` (or `noProxy`) exempts hosts by suffix; `"upstreamProxy": false`
+  ignores the environment entirely.
+- **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
+  ciphertext only, and certificate verification is unchanged. A proxy that
+  intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
+- SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
+  rejected at startup rather than failing later at connect time.
+
+This is a property of the **network**, not a routing policy: when set, it is
+simply how this machine reaches Anthropic. That is what separates it from sx.org
+below, which is a specific egress *provider* chosen per request. If both are
+configured, a request routed via sx.org uses sx.org; everything else uses the
+upstream proxy. Neither is related to `proxy.port`, which is the local port
+Claude Code connects **to**.
+
 ## sx.org proxy mode
 
 Off by default. Some transient `429`s key on the proxy's **outbound IP**, not the account, so rotating accounts doesn't help. To work around them, TeamClaude can route upstream requests through a residential proxy from [sx.org](https://sx.org), giving a different egress IP.

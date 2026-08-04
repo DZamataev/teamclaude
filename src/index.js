@@ -22,6 +22,7 @@ import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
+import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -414,6 +415,14 @@ async function serverCommand() {
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
+    // Announce an egress proxy, especially one inherited from the environment:
+    // it changes where every upstream byte goes, and a value nobody typed here
+    // should never be in force silently.
+    const egressProxy = getUpstreamProxy();
+    if (egressProxy.proxy) {
+      const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
+      console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -1419,6 +1428,15 @@ launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+
+Upstream proxy. On a host with no direct route to the internet, set
+"upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
+outbound connection — request forwarding, OAuth login, token refresh, profile
+and usage — is CONNECT-tunneled through it, TLS end to end. HTTPS_PROXY /
+ALL_PROXY are honored when the config says nothing, NO_PROXY exempts hosts, and
+"upstreamProxy": false ignores the environment entirely. Settable live in the
+TUI settings screen. Distinct from "proxy" (the local port Claude Code talks to)
+and from sx.org (a specific residential-egress provider with its own policy).
 
 Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
 hold requests whenever the exit IP is not the pinned one — a VPN that dropped
