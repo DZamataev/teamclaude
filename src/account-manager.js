@@ -99,6 +99,14 @@ function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
 }
 
+// A representative model for a route's own globs, used to report what that route
+// does right now (which accounts may serve it, and which one it would pick).
+// Taken from the route object rather than looked up by name, so two routes
+// sharing a name are still each described by their own globs.
+function sampleModelFor(route) {
+  return route.match[0].replace(/\*/g, '') || 'model';
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
@@ -683,13 +691,16 @@ export class AccountManager {
    * own weekly bucket but no configured route already covers. Auto-created routes
    * carry `autocreated: true` and are never persisted — they simply surface the
    * per-model quota the server already respects. Each route lists the accounts it
-   * can use with a live eligibility flag.
+   * can use with a live eligibility flag, plus `target`: the one account it would
+   * pick right now. Everything here is derived for display and thrown away — the
+   * entries are fresh objects, never the stored (persisted) route definitions.
    */
   getRoutes() {
     const out = this.routes.map(r => ({
       name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
       pinned: this._pinnedName(r.name),
       accounts: this._routeAccountsView(r),
+      target: this._routeTarget(sampleModelFor(r)),
     }));
 
     const detected = [];
@@ -705,9 +716,17 @@ export class AccountManager {
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
         pinned: this._pinnedName(d.name),
         accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
+        target: this._routeTarget(d.sample),
       });
     }
     return out;
+  }
+
+  /** The name of the account a request for `model` would land on right now, or
+   * null when nothing can serve it (every candidate disabled, spent or excluded). */
+  _routeTarget(model) {
+    const idx = this.previewRouteIndex(model);
+    return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
   /** The name of the account this route is manually pinned to, or null. */
@@ -719,7 +738,7 @@ export class AccountManager {
   /** Accounts a configured route can use (all accounts when it lists none), each
    * with a live eligibility flag for a representative model of the route. */
   _routeAccountsView(route) {
-    const sample = route.match[0].replace(/\*/g, '') || 'model';
+    const sample = sampleModelFor(route);
     const inRoute = a => !route.accounts.length
       || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
     return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));

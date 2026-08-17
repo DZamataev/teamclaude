@@ -16,6 +16,7 @@ import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
@@ -48,6 +49,10 @@ switch (command) {
     break;
   case 'status':
     await statusCommand();
+    process.exit(0);
+    break;
+  case 'attach':
+    await attachCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -828,6 +833,49 @@ async function statusCommand() {
   }
 }
 
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
+  try {
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
+  });
+}
+
 // ── switch ──────────────────────────────────────────────────
 
 // Manual account switch against a RUNNING server — the headless equivalent of
@@ -1460,6 +1508,8 @@ Commands:
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
