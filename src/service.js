@@ -14,6 +14,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { isDeploymentOwnedDefinition } from './deploy/service.js';
 
 export const LABEL = 'com.karpeleslab.teamclaude';
 export const UNIT_NAME = 'teamclaude.service';
@@ -146,6 +147,23 @@ function runCommand(cmd, args) {
 /** `gui/<uid>` — the launchd domain a per-user agent lives in. */
 const guiDomain = (uid = process.getuid?.() ?? 0) => `gui/${uid}`;
 
+const DEPLOYMENT_OWNED_REFUSAL = Object.freeze({
+  ok: false,
+  error: 'This service is managed by teamclaude deploy. Use: teamclaude deploy status',
+  deploymentOwned: true,
+});
+
+async function refuseDeploymentOwned(file) {
+  try {
+    return isDeploymentOwnedDefinition(await readFile(file, 'utf8'))
+      ? { ...DEPLOYMENT_OWNED_REFUSAL }
+      : null;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 export async function installService({
   kind = serviceKind(), home = homedir(), platform = process.platform,
   exec = resolveExec(), run = runCommand, configPath = null, log = console.log,
@@ -157,6 +175,8 @@ export async function installService({
 
   if (kind === 'launchd') {
     const plist = launchAgentPath(home);
+    const refusal = await refuseDeploymentOwned(plist);
+    if (refusal) return refusal;
     await mkdir(dirname(plist), { recursive: true });
     await mkdir(dirname(logFile), { recursive: true });
     await writeFile(plist, renderLaunchAgent({ ...exec, log: logFile, path, configPath }), { mode: 0o644 });
@@ -172,6 +192,8 @@ export async function installService({
   }
 
   const unit = systemdUnitPath(home, xdgConfig);
+  const refusal = await refuseDeploymentOwned(unit);
+  if (refusal) return refusal;
   await mkdir(dirname(unit), { recursive: true });
   await writeFile(unit, renderSystemdUnit({ ...exec, path, configPath }), { mode: 0o644 });
   run('systemctl', ['--user', 'daemon-reload']);
@@ -192,12 +214,16 @@ export async function uninstallService({
   if (!kind) return { ok: false, error: 'No service integration for this platform' };
   if (kind === 'launchd') {
     const plist = launchAgentPath(home);
+    const refusal = await refuseDeploymentOwned(plist);
+    if (refusal) return refusal;
     run('launchctl', ['bootout', `${guiDomain()}/${LABEL}`]);
     await rm(plist, { force: true });
     log(`[TeamClaude] Service removed: ${plist}`);
     return { ok: true, file: plist };
   }
   const unit = systemdUnitPath(home, xdgConfig);
+  const refusal = await refuseDeploymentOwned(unit);
+  if (refusal) return refusal;
   run('systemctl', ['--user', 'disable', '--now', UNIT_NAME]);
   await rm(unit, { force: true });
   run('systemctl', ['--user', 'daemon-reload']);
