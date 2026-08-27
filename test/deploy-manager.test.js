@@ -13,6 +13,23 @@ function validConfig() {
   return { accounts: [{ type: 'apikey', apiKey: 'secret' }] };
 }
 
+function deploymentMetadata(layout, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    remoteUrl,
+    requestedRef: 'master',
+    nodePath: '/absolute/node',
+    launcherPath: '/usr/local/bin/teamclaude',
+    configPath: layout.configPath,
+    serviceKind: 'systemd',
+    installedAt: '2026-08-27T10:30:03.000Z',
+    npmCleanupPending: false,
+    npmRestore: { packageName: '@karpeleslab/teamclaude', version: null, npmPath: '/absolute/npm' },
+    serviceBackup: null,
+    ...overrides,
+  };
+}
+
 function fixture(overrides = {}) {
   const calls = [];
   const metadataWrites = [];
@@ -60,6 +77,7 @@ function fixture(overrides = {}) {
       createCandidate: async () => { calls.push('createCandidate'); return candidate; },
       readSelection: async () => ({ current: oldRelease, previous: null }),
       activate: async () => { calls.push('activateCandidate'); return { current: candidate.path, previous: oldRelease }; },
+      swapForRollback: async () => { calls.push('swapForRollback'); return { current: oldRelease, previous: candidate.path }; },
       restoreSelection: async () => calls.push('restoreSelection'),
       describeRelease: async path => ({ path, commit: path === candidate.path ? candidate.commit : 'b'.repeat(40) }),
     },
@@ -295,4 +313,141 @@ test('legacy Git layout is adopted without clone, release deletion, or npm-versi
   assert.deepEqual(fx.metadataWrites[0].npmRestore, {
     packageName: '@karpeleslab/teamclaude', version: null, npmPath: '/absolute/npm',
   });
+});
+
+test('deployRef tests an immutable candidate before activation and updates only requestedRef', async () => {
+  const fx = fixture();
+  const metadata = deploymentMetadata(fx.layout);
+  fx.dependencies.readDeployment = async () => metadata;
+  const result = await createDeployManager(fx.dependencies).deployRef({ ref: 'feature/deploy' });
+  assert.deepEqual(fx.calls, [
+    'ensureRepository', 'fetch', 'resolveRef', 'createCandidate', 'testCandidate',
+    'activateCandidate', 'restartService', 'serviceHealth', 'applicationHealth',
+    'writeMetadataWithRestoreState',
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.requestedRef, 'feature/deploy');
+  assert.equal(result.commit, candidate.commit);
+  assert.deepEqual(fx.metadataWrites[0], { ...metadata, requestedRef: 'feature/deploy' });
+});
+
+test('deployRef test failure never activates or restarts', async () => {
+  const fx = fixture();
+  fx.dependencies.readDeployment = async () => deploymentMetadata(fx.layout);
+  fx.dependencies.runCandidateTests = async () => { fx.calls.push('testCandidate'); throw new Error('test failure'); };
+  await assert.rejects(createDeployManager(fx.dependencies).deployRef({ ref: 'broken' }), /test failure/);
+  assert.equal(fx.calls.includes('activateCandidate'), false);
+  assert.equal(fx.calls.includes('restartService'), false);
+  assert.equal(fx.metadataWrites.length, 0);
+});
+
+test('deployRef restores selection and old runtime after post-activation failure', async () => {
+  const fx = fixture();
+  fx.dependencies.readDeployment = async () => deploymentMetadata(fx.layout);
+  let restarts = 0;
+  fx.dependencies.service.restart = async () => {
+    fx.calls.push('restartService');
+    restarts += 1;
+    if (restarts === 1) throw new Error('candidate restart failed');
+  };
+  await assert.rejects(createDeployManager(fx.dependencies).deployRef({ ref: 'broken' }), /candidate restart failed/);
+  assert.ok(fx.calls.indexOf('restoreSelection') > fx.calls.indexOf('activateCandidate'));
+  assert.ok(fx.calls.lastIndexOf('restartService') > fx.calls.indexOf('restoreSelection'));
+  assert.ok(fx.calls.lastIndexOf('serviceHealth') > fx.calls.indexOf('restoreSelection'));
+  assert.ok(fx.calls.lastIndexOf('applicationHealth') > fx.calls.indexOf('restoreSelection'));
+  assert.equal(fx.metadataWrites.length, 0);
+});
+
+test('rollback swaps releases, verifies them, and restores the exact pair on failure', async () => {
+  const success = fixture();
+  success.dependencies.readDeployment = async () => deploymentMetadata(success.layout);
+  const result = await createDeployManager(success.dependencies).rollback();
+  assert.deepEqual(success.calls, ['swapForRollback', 'restartService', 'serviceHealth', 'applicationHealth']);
+  assert.deepEqual(result, { ok: true, current: oldRelease, previous: candidate.path });
+
+  const failed = fixture();
+  failed.dependencies.readDeployment = async () => deploymentMetadata(failed.layout);
+  let checks = 0;
+  failed.dependencies.checkHealth = async () => {
+    failed.calls.push('applicationHealth');
+    checks += 1;
+    return checks > 20;
+  };
+  const manager = createDeployManager(failed.dependencies);
+  await assert.rejects(manager.rollback(), /deployment did not become healthy/);
+  assert.ok(failed.calls.indexOf('restoreSelection') > failed.calls.indexOf('swapForRollback'));
+  assert.ok(failed.calls.lastIndexOf('restartService') > failed.calls.indexOf('restoreSelection'));
+  assert.equal(failed.metadataWrites.length, 0);
+});
+
+test('restart checks health without touching Git, links, or metadata', async () => {
+  const fx = fixture();
+  fx.dependencies.readDeployment = async () => deploymentMetadata(fx.layout);
+  assert.deepEqual(await createDeployManager(fx.dependencies).restart(), { ok: true });
+  assert.deepEqual(fx.calls, ['restartService', 'serviceHealth', 'applicationHealth']);
+  assert.equal(fx.metadataWrites.length, 0);
+});
+
+test('logs validates bounded integer line counts and delegates follow mode', async () => {
+  const fx = fixture();
+  fx.dependencies.readDeployment = async () => deploymentMetadata(fx.layout);
+  fx.dependencies.service.logs = options => { fx.calls.push(`logs:${options.lines}:${options.follow}`); return { code: 0 }; };
+  const manager = createDeployManager(fx.dependencies);
+  for (const lines of [0, -1, 1.5, 100001]) {
+    await assert.rejects(manager.logs({ lines }), /lines/i);
+  }
+  assert.deepEqual(await manager.logs(), { ok: true, code: 0 });
+  assert.deepEqual(await manager.logs({ lines: 25, follow: false }), { ok: true, code: 0 });
+  assert.deepEqual(fx.calls, ['logs:100:true', 'logs:25:false']);
+});
+
+test('status is JSON-safe and describes actual release commits', async () => {
+  const fx = fixture();
+  const backup = {
+    source: fx.layout.serviceFile,
+    backupPath: '/opt/teamclaude/backups/20260827T103003Z/teamclaude.service',
+    sha256: 'd'.repeat(64), wasRunning: true, restoreOnUninstall: false,
+  };
+  const metadata = deploymentMetadata(fx.layout, { serviceBackup: backup });
+  fx.dependencies.readDeployment = async () => metadata;
+  fx.dependencies.store.readSelection = async () => ({ current: candidate.path, previous: oldRelease });
+  fx.dependencies.store.describeRelease = async path => ({
+    path,
+    commit: path === candidate.path ? candidate.commit : 'b'.repeat(40),
+  });
+  const status = await createDeployManager(fx.dependencies).status();
+  assert.deepEqual(status, {
+    schemaVersion: 1,
+    platform: 'linux',
+    root: '/opt/teamclaude',
+    remoteUrl,
+    requestedRef: 'master',
+    current: { path: candidate.path, commit: candidate.commit },
+    previous: { path: oldRelease, commit: 'b'.repeat(40) },
+    service: { kind: 'systemd', running: true },
+    nodePath: '/absolute/node',
+    launcherPath: '/usr/local/bin/teamclaude',
+    configPath: fx.layout.configPath,
+    npmCleanupPending: false,
+    npmRestore: metadata.npmRestore,
+    serviceBackup: backup,
+  });
+
+  const absent = fixture({ readDeployment: async () => null });
+  assert.deepEqual(await createDeployManager(absent.dependencies).status(), {
+    installed: false, platform: 'linux', root: '/opt/teamclaude', detail: 'not installed',
+  });
+  assert.deepEqual(absent.calls, []);
+});
+
+test('operations other than status explain how to install when metadata is absent', async () => {
+  const fx = fixture({ readDeployment: async () => null });
+  const manager = createDeployManager(fx.dependencies);
+  for (const operation of [
+    () => manager.deployRef({ ref: 'master' }),
+    () => manager.rollback(),
+    () => manager.restart(),
+    () => manager.logs(),
+  ]) await assert.rejects(operation(), /teamclaude deploy install <git-url>/i);
+  assert.deepEqual(fx.calls, []);
 });

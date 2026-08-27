@@ -119,6 +119,36 @@ export function createDeployManager(dependencies = {}) {
     throw new Error(`deployment did not become healthy after ${HEALTH_ATTEMPTS} attempts`);
   }
 
+  async function requireMetadata({ mutation = true } = {}) {
+    const metadata = await readDeployment(layout);
+    if (!metadata) {
+      throw new Error('Git deployment is not installed. Run: teamclaude deploy install <git-url>');
+    }
+    if (mutation) assertMutationAllowed(layout, { uid });
+    return metadata;
+  }
+
+  function rollbackAggregate(candidateError, rollbackError) {
+    const logCommand = layout.kind === 'systemd'
+      ? 'teamclaude deploy logs --no-follow'
+      : `tail -n 100 ${layout.logFile}`;
+    return new AggregateError(
+      [candidateError, rollbackError],
+      `Candidate deployment failed: ${candidateError.message}. Rollback also failed: ${rollbackError.message}. Inspect logs with: ${logCommand}`,
+    );
+  }
+
+  async function restoreRuntime(selection, metadata, candidateError) {
+    try {
+      await store.restoreSelection(selection);
+      await service.restart();
+      await waitForHealth(metadata);
+    } catch (rollbackError) {
+      throw rollbackAggregate(candidateError, rollbackError);
+    }
+    throw candidateError;
+  }
+
   async function install({ remoteUrl, ref = 'master' }) {
     const { bootstrap } = await preflight({ remoteUrl, ref });
     const existingMetadata = await readDeployment(layout);
@@ -238,5 +268,89 @@ export function createDeployManager(dependencies = {}) {
     };
   }
 
-  return { install };
+  async function deployRef({ ref }) {
+    const metadata = await requireMetadata();
+    validateRequestedRef(ref);
+    await store.ensureRepository(metadata.remoteUrl);
+    await store.fetch();
+    const commit = await store.resolveRef(ref);
+    const candidate = await store.createCandidate(commit);
+    await runCandidateTests(candidate, metadata.nodePath);
+    const originalSelection = await store.readSelection();
+    await store.activate(candidate.path);
+    try {
+      await service.restart();
+      await waitForHealth(metadata);
+    } catch (candidateError) {
+      return restoreRuntime(originalSelection, metadata, candidateError);
+    }
+    await writeDeployment(layout, { ...metadata, requestedRef: ref });
+    return {
+      ok: true,
+      requestedRef: ref,
+      commit,
+      releasePath: candidate.path,
+      previous: originalSelection.current,
+    };
+  }
+
+  async function rollback() {
+    const metadata = await requireMetadata();
+    const originalSelection = await store.readSelection();
+    const selection = await store.swapForRollback();
+    try {
+      await service.restart();
+      await waitForHealth(metadata);
+    } catch (candidateError) {
+      return restoreRuntime(originalSelection, metadata, candidateError);
+    }
+    return { ok: true, current: selection.current, previous: selection.previous };
+  }
+
+  async function restart() {
+    const metadata = await requireMetadata();
+    await service.restart();
+    await waitForHealth(metadata);
+    return { ok: true };
+  }
+
+  async function logs({ lines = 100, follow = true } = {}) {
+    if (!Number.isInteger(lines) || lines < 1 || lines > 100_000) {
+      throw new Error('logs lines must be an integer from 1 to 100000');
+    }
+    await requireMetadata({ mutation: false });
+    const result = await service.logs({ lines, follow });
+    return { ok: result.code === 0, code: result.code };
+  }
+
+  async function status() {
+    const metadata = await readDeployment(layout);
+    if (!metadata) {
+      return { installed: false, platform: layout.platform, root: layout.root, detail: 'not installed' };
+    }
+    const selection = await store.readSelection();
+    const [current, previous, serviceState] = await Promise.all([
+      selection.current ? store.describeRelease(selection.current) : null,
+      selection.previous ? store.describeRelease(selection.previous) : null,
+      service.status(),
+    ]);
+    return {
+      schemaVersion: metadata.schemaVersion,
+      platform: layout.platform,
+      root: layout.root,
+      remoteUrl: metadata.remoteUrl,
+      requestedRef: metadata.requestedRef,
+      current,
+      previous,
+      service: serviceState,
+      nodePath: metadata.nodePath,
+      launcherPath: metadata.launcherPath,
+      configPath: metadata.configPath,
+      npmCleanupPending: metadata.npmCleanupPending,
+      npmRestore: metadata.npmRestore,
+      serviceBackup: metadata.serviceBackup,
+    };
+  }
+
+  return { install, deployRef, rollback, restart, logs, status };
 }
