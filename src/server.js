@@ -53,6 +53,21 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+function authorizeBaseUrlClient(req, proxyApiKey) {
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  const bearerKey = bearerMatch?.[1];
+  const hasProxyKey = safeKeyEqual(req.headers['x-api-key'], proxyApiKey)
+    || safeKeyEqual(bearerKey, proxyApiKey);
+  const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+  if (proxyApiKey && !hasProxyKey && !isLocal) return false;
+
+  if (proxyApiKey && safeKeyEqual(bearerKey, proxyApiKey)) {
+    // The proxy credential authenticates this hop and must not reach upstream.
+    delete req.headers.authorization;
+  }
+  return true;
+}
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -65,10 +80,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const requestHandler = async (req, res) => {
     try {
-      // Auth check — skip for localhost connections.
-      const clientKey = req.headers['x-api-key'];
-      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
+      // Base-URL clients may carry the proxy key in either Anthropic auth form.
+      // Bearer lets OAuth-aware SDKs build the OAuth request before this proxy
+      // replaces the placeholder credential with the selected account token.
+      if (!authorizeBaseUrlClient(req, proxyApiKey)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -221,7 +236,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
-  server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+  server.on('upgrade', (req, socket, head) => {
+    if (!authorizeBaseUrlClient(req, proxyApiKey)) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      return;
+    }
+    relayUpgrade(req, socket, head, upstream, sx);
+  });
 
   return server;
 }

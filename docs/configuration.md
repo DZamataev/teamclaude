@@ -39,7 +39,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | --- | --- |
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
-| `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
+| `proxy.apiKey` | API key clients use to authenticate with the proxy through `x-api-key` or `Authorization: Bearer …` (required for any non-loopback client; the proxy removes this credential before injecting the selected account token, so an unauthenticated open port would leak real account tokens) |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI settings screen: **Switch threshold**) |
 | `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe`, or the **Quota probe** row on the TUI settings screen) |
