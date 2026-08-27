@@ -95,7 +95,7 @@ export function createDeployManager(dependencies = {}) {
   const removeDeploymentRoot = dependencies.removeDeploymentRoot
     || (() => fs.rm(layout.root, { recursive: true, force: false }));
   const verifyRestoredCommand = dependencies.verifyRestoredCommand || (async resolved => {
-    const result = run(resolved.commandPath, ['version']);
+    const result = run(resolved.nodePath, [resolved.commandPath, 'version']);
     if (commandFailed(result)) throw new Error(`Restored command failed verification: ${resolved.commandPath} version`);
   });
   const validateLauncher = dependencies.validateLauncher || (async path => {

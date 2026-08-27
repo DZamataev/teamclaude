@@ -242,7 +242,7 @@ export async function restoreGlobalNpm(resolved, { run = defaultRun } = {}) {
   const installArgs = ['install', '--global', resolved.packageSpec];
   const installed = run(resolved.nodePath, [resolved.npmPath, ...installArgs], { stdio: 'inherit' });
   if (!commandSucceeded(installed)) throw commandError(resolved.npmPath, installArgs, installed);
-  const verified = run(resolved.commandPath, ['version']);
+  const verified = run(resolved.nodePath, [resolved.commandPath, 'version']);
   if (!commandSucceeded(verified)) throw commandError(resolved.commandPath, ['version'], verified);
   return { ...resolved };
 }

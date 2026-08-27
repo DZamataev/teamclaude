@@ -232,7 +232,11 @@ test('npm restoration resolves exact command path, installs requested version, a
       argv: ['/absolute/npm', 'install', '--global', '@karpeleslab/teamclaude@1.1.13'],
       options: { stdio: 'inherit' },
     },
-    { command: '/opt/npm-global/bin/teamclaude', argv: ['version'], options: {} },
+    {
+      command: '/absolute/node',
+      argv: ['/opt/npm-global/bin/teamclaude', 'version'],
+      options: {},
+    },
   ]);
 });
 
