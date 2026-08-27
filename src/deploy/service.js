@@ -142,6 +142,19 @@ export function createDeployServiceAdapter({
     }
   }
 
+  async function readRegularDefinition() {
+    const before = await fs.lstat(layout.serviceFile);
+    if (!before.isFile() || before.isSymbolicLink()) {
+      throw new Error(`Service definition must be a regular file, not a symbolic link: ${layout.serviceFile}`);
+    }
+    const contents = await fs.readFile(layout.serviceFile, 'utf8');
+    const after = await fs.lstat(layout.serviceFile);
+    if (!after.isFile() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
+      throw new Error(`Service definition changed during inspection: ${layout.serviceFile}`);
+    }
+    return contents;
+  }
+
   async function atomicWrite(path, contents, mode = 0o644) {
     await fs.mkdir(dirname(path), { recursive: true });
     const temporary = `${path}.next-${process.pid}-${randomUUID()}`;
@@ -194,7 +207,7 @@ export function createDeployServiceAdapter({
 
   async function backupExisting() {
     if (!await exists(layout.serviceFile)) return null;
-    const contents = await fs.readFile(layout.serviceFile, 'utf8');
+    const contents = await readRegularDefinition();
     const state = await status();
     const base = join(layout.backups, timestamp(now()));
     let directory = base;
@@ -261,7 +274,7 @@ export function createDeployServiceAdapter({
 
   async function removeOwnedDefinition() {
     if (!await exists(layout.serviceFile)) return { removed: false };
-    const contents = await fs.readFile(layout.serviceFile, 'utf8');
+    const contents = await readRegularDefinition();
     if (!isDeploymentOwnedDefinition(contents)) {
       throw new Error(`Service definition is not deployment-owned: ${layout.serviceFile}`);
     }

@@ -1,8 +1,11 @@
 import { spawnSync } from 'node:child_process';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import * as fsPromises from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { loadConfig as defaultLoadConfig } from '../config.js';
 import {
   DEPLOYMENT_SCHEMA_VERSION,
+  assertSafeRootRemoval as defaultAssertSafeRootRemoval,
   assertMutationAllowed,
   readDeployment as defaultReadDeployment,
   validateInstallConfig,
@@ -11,6 +14,7 @@ import {
 import { createGitReleaseStore, validateRemoteUrl, validateRequestedRef } from './git-releases.js';
 import {
   createDeployServiceAdapter,
+  isDeploymentOwnedDefinition,
   renderLaunchAgent,
   renderSystemdService,
 } from './service.js';
@@ -18,6 +22,10 @@ import {
   chooseLauncherPath as defaultChooseLauncherPath,
   discoverBootstrap as defaultDiscoverBootstrap,
   handoffLauncher as defaultHandoffLauncher,
+  LAUNCHER_OWNER,
+  removeOwnedLauncher as defaultRemoveOwnedLauncher,
+  resolveNpmRestore as defaultResolveNpmRestore,
+  restoreGlobalNpm as defaultRestoreGlobalNpm,
 } from './launcher.js';
 
 export const TEST_TIMEOUT_MS = 120_000;
@@ -66,6 +74,57 @@ export function createDeployManager(dependencies = {}) {
   const discoverBootstrap = dependencies.discoverBootstrap || defaultDiscoverBootstrap;
   const chooseLauncherPath = dependencies.chooseLauncherPath || defaultChooseLauncherPath;
   const handoffLauncher = dependencies.handoffLauncher || defaultHandoffLauncher;
+  const fs = dependencies.fs || fsPromises;
+  const validateUninstallLayout = dependencies.validateUninstallLayout || defaultAssertSafeRootRemoval;
+  const assertSafeRootRemoval = dependencies.assertSafeRootRemoval || defaultAssertSafeRootRemoval;
+  const readServiceDefinition = dependencies.readServiceDefinition || (async () => {
+    const before = await fs.lstat(layout.serviceFile);
+    if (!before.isFile() || before.isSymbolicLink()) {
+      throw new Error(`Service definition must be a regular file: ${layout.serviceFile}`);
+    }
+    const contents = await fs.readFile(layout.serviceFile, 'utf8');
+    const after = await fs.lstat(layout.serviceFile);
+    if (!after.isFile() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
+      throw new Error(`Service definition changed during inspection: ${layout.serviceFile}`);
+    }
+    return contents;
+  });
+  const resolveNpmRestore = dependencies.resolveNpmRestore || defaultResolveNpmRestore;
+  const restoreGlobalNpm = dependencies.restoreGlobalNpm || defaultRestoreGlobalNpm;
+  const removeOwnedLauncher = dependencies.removeOwnedLauncher || defaultRemoveOwnedLauncher;
+  const removeDeploymentRoot = dependencies.removeDeploymentRoot
+    || (() => fs.rm(layout.root, { recursive: true, force: false }));
+  const verifyRestoredCommand = dependencies.verifyRestoredCommand || (async resolved => {
+    const result = run(resolved.commandPath, ['version']);
+    if (commandFailed(result)) throw new Error(`Restored command failed verification: ${resolved.commandPath} version`);
+  });
+  const validateLauncher = dependencies.validateLauncher || (async path => {
+    try {
+      const stat = await fs.lstat(path);
+      if (stat.isSymbolicLink()) return { exists: true, owned: false, symlink: true };
+      if (!stat.isFile()) return { exists: true, owned: false, symlink: false };
+      const contents = await fs.readFile(path, 'utf8');
+      return { exists: true, owned: contents.includes(`TeamClaude-Owner: ${LAUNCHER_OWNER}`), symlink: false };
+    } catch (error) {
+      if (error.code === 'ENOENT') return { exists: false, owned: false, symlink: false };
+      throw error;
+    }
+  });
+  const stageLauncher = dependencies.stageLauncher || (async launcherPath => {
+    const directory = await fs.mkdtemp(join(tmpdir(), 'teamclaude-uninstall-'));
+    const path = join(directory, 'teamclaude');
+    await fs.copyFile(launcherPath, path);
+    await fs.chmod(path, 0o700);
+    return { path };
+  });
+  const restoreStagedLauncher = dependencies.restoreStagedLauncher || (async (staged, launcherPath) => {
+    await fs.mkdir(dirname(launcherPath), { recursive: true, mode: 0o755 });
+    await fs.copyFile(staged.path, launcherPath);
+    await fs.chmod(launcherPath, 0o755);
+  });
+  const cleanupStagedLauncher = dependencies.cleanupStagedLauncher || (async staged => {
+    if (staged?.path) await fs.rm(dirname(staged.path), { recursive: true, force: true });
+  });
   const renderService = dependencies.renderService || defaultRenderService;
   const sleep = dependencies.sleep || (milliseconds => new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds)));
   const now = dependencies.now || (() => new Date());
@@ -352,5 +411,153 @@ export function createDeployManager(dependencies = {}) {
     };
   }
 
-  return { install, deployRef, rollback, restart, logs, status };
+  async function uninstall({ restoreNpm } = {}) {
+    if (typeof restoreNpm !== 'boolean') {
+      throw new Error('uninstall restoreNpm must be an explicit boolean');
+    }
+    const metadata = await requireMetadata();
+    await validateUninstallLayout(layout, metadata);
+    await store.readSelection();
+    const deploymentDefinition = await readServiceDefinition();
+    if (!isDeploymentOwnedDefinition(deploymentDefinition)) {
+      throw new Error(`Service definition is not deployment-owned: ${layout.serviceFile}`);
+    }
+    const validBackup = metadata.serviceBackup
+      ? await service.validateBackup(metadata.serviceBackup)
+      : null;
+    const launcherState = await validateLauncher(metadata.launcherPath);
+    if (launcherState.exists && !launcherState.owned && restoreNpm) {
+      throw new Error(`Refusing to overwrite a launcher that is not deployment-owned: ${metadata.launcherPath}`);
+    }
+
+    let resolvedNpm = null;
+    if (restoreNpm) {
+      resolvedNpm = await resolveNpmRestore({
+        npmRestore: metadata.npmRestore,
+        nodePath: metadata.nodePath,
+        run,
+      });
+      const commandState = resolvedNpm.commandPath === metadata.launcherPath
+        ? launcherState
+        : await validateLauncher(resolvedNpm.commandPath);
+      if (commandState.exists && !commandState.owned) {
+        throw new Error(`Refusing to overwrite a non-deployment command: ${resolvedNpm.commandPath}`);
+      }
+      if (!launcherState.exists || !launcherState.owned || launcherState.symlink) {
+        throw new Error(`A regular deployment-owned launcher is required for safe npm restoration: ${metadata.launcherPath}`);
+      }
+    }
+
+    const stagedLauncher = launcherState.exists && launcherState.owned
+      ? await stageLauncher(metadata.launcherPath)
+      : null;
+    let npmRestored = false;
+    if (restoreNpm) {
+      try {
+        await restoreGlobalNpm(resolvedNpm, { run });
+        npmRestored = true;
+      } catch (error) {
+        if (stagedLauncher) await restoreStagedLauncher(stagedLauncher, metadata.launcherPath).catch(() => {});
+        await cleanupStagedLauncher(stagedLauncher).catch(() => {});
+        throw new Error(
+          `npm restoration failed: ${error.message}. Retry manually: npm install --global ${resolvedNpm.packageSpec}`,
+          { cause: error },
+        );
+      }
+    }
+
+    const shouldRestorePriorService = Boolean(
+      restoreNpm && validBackup?.restoreOnUninstall,
+    );
+    let restoredService = false;
+    let launcherRemoved = false;
+    let commitBoundary = false;
+    try {
+      await service.stop();
+      await service.removeOwnedDefinition();
+      if (shouldRestorePriorService) {
+        await service.restore(validBackup);
+        const priorState = await service.status();
+        if (!priorState.installed || (validBackup.wasRunning && !priorState.running)) {
+          throw new Error('The prior TeamClaude service did not restore to its recorded state');
+        }
+        restoredService = true;
+      }
+      const launcherResult = await removeOwnedLauncher({ launcherPath: metadata.launcherPath });
+      launcherRemoved = launcherResult.removed;
+      await assertSafeRootRemoval(layout, metadata);
+      commitBoundary = true;
+      await removeDeploymentRoot(layout.root);
+    } catch (primaryError) {
+      if (commitBoundary) {
+        if (restoreNpm) await verifyRestoredCommand(resolvedNpm).catch(() => {});
+        await cleanupStagedLauncher(stagedLauncher).catch(() => {});
+        return {
+          ok: false,
+          partial: true,
+          restoredNpm: npmRestored,
+          packageSpec: resolvedNpm?.packageSpec || null,
+          commandPath: resolvedNpm?.commandPath || null,
+          restoredService,
+          launcherRemoved,
+          removedRoot: false,
+          remainingPaths: [layout.root],
+          warning: `Deployment teardown committed, but the deployment root remains: ${primaryError.message}`,
+        };
+      }
+
+      const compensationErrors = [];
+      try {
+        await service.stop().catch(() => {});
+        await service.install(deploymentDefinition);
+        if (stagedLauncher) await restoreStagedLauncher(stagedLauncher, metadata.launcherPath);
+        await service.start();
+        await waitForHealth(metadata);
+      } catch (error) {
+        compensationErrors.push(error);
+      }
+      await cleanupStagedLauncher(stagedLauncher).catch(() => {});
+      if (compensationErrors.length > 0) {
+        throw rollbackAggregate(primaryError, compensationErrors[0]);
+      }
+      throw primaryError;
+    }
+
+    if (restoreNpm) {
+      try {
+        await verifyRestoredCommand(resolvedNpm);
+      } catch (error) {
+        await cleanupStagedLauncher(stagedLauncher).catch(() => {});
+        return {
+          ok: false,
+          partial: true,
+          restoredNpm: npmRestored,
+          packageSpec: resolvedNpm.packageSpec,
+          commandPath: resolvedNpm.commandPath,
+          restoredService,
+          launcherRemoved,
+          removedRoot: true,
+          remainingPaths: [resolvedNpm.commandPath],
+          warning: `Deployment was removed, but the restored npm command failed verification: ${error.message}`,
+        };
+      }
+    }
+    await cleanupStagedLauncher(stagedLauncher);
+    return {
+      ok: true,
+      partial: false,
+      restoredNpm: npmRestored,
+      packageSpec: resolvedNpm?.packageSpec || null,
+      commandPath: resolvedNpm?.commandPath || null,
+      restoredService,
+      launcherRemoved,
+      removedRoot: true,
+      remainingPaths: [],
+      ...(!restoreNpm ? {
+        warning: 'TeamClaude was intentionally left uninstalled; the config, state, nginx, and retained logs were preserved.',
+      } : {}),
+    };
+  }
+
+  return { install, deployRef, rollback, restart, logs, status, uninstall };
 }

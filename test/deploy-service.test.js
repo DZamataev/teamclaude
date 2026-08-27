@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -160,6 +160,21 @@ test('owned definition removal refuses an operator-owned file', async (t) => {
   const adapter = createDeployServiceAdapter({ layout: l, run: rec.run });
   await assert.rejects(adapter.removeOwnedDefinition(), /not deployment-owned/i);
   assert.equal(await readFile(l.serviceFile, 'utf8'), '[Service]\nExecStart=/operator/teamclaude\n');
+  assert.equal(rec.calls.length, 0);
+});
+
+test('service backup and removal never follow a service-definition symlink', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-deploy-service-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const l = layout(home, 'linux');
+  const target = join(home, 'operator-owned-target');
+  await writeFile(target, renderSystemdService({ layout: l, nodePath: '/node' }));
+  await symlink(target, l.serviceFile);
+  const rec = recorder();
+  const adapter = createDeployServiceAdapter({ layout: l, run: rec.run });
+  await assert.rejects(adapter.backupExisting(), /regular file|symbolic link/i);
+  await assert.rejects(adapter.removeOwnedDefinition(), /regular file|symbolic link/i);
+  assert.match(await readFile(target, 'utf8'), /TeamClaude-Owner/);
   assert.equal(rec.calls.length, 0);
 });
 
