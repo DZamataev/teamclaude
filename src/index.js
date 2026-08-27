@@ -24,6 +24,7 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+import { runDeployCli } from './deploy/cli.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -90,6 +91,9 @@ switch (command) {
   case 'service':
     await serviceCommand();
     process.exit(0);
+    break;
+  case 'deploy':
+    process.exit(await runDeployCli(args.slice(1)));
     break;
   case 'probe':
     await probeCommand();
@@ -1506,6 +1510,8 @@ Commands:
                       restarts on its own: install | uninstall | status | print
                       (LaunchAgent on macOS, systemd --user unit on Linux;
                       'print' writes the unit to stdout without touching anything)
+  deploy <sub>        Install and operate a boot-persistent Git deployment;
+                      run 'teamclaude deploy help' for subcommands
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
