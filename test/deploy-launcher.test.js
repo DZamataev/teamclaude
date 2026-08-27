@@ -55,6 +55,24 @@ test('bootstrap discovery rejects old Node and ignores a PATH node from another 
   assert.equal(bootstrap.npmPath, '/opt/homebrew/bin/npm');
 });
 
+test('bootstrap discovery finds npm beside NVM Node when non-interactive PATH omits NVM', () => {
+  const nodePath = '/root/.nvm/versions/node/v24.19.0/bin/node';
+  const npmPath = '/root/.nvm/versions/node/v24.19.0/bin/npm';
+  const bootstrap = discoverBootstrap({
+    execPath: nodePath,
+    nodeVersion: '24.19.0',
+    pathEnv: '/usr/local/bin:/usr/bin:/bin',
+    findExecutable: command => command === 'node' ? '/usr/bin/node' : null,
+    realpath: value => value === '/usr/bin/node' ? '/usr/bin/node-v18' : value,
+    isExecutable: value => value === nodePath || value === npmPath,
+    installKind: 'git',
+    packageVersion: '1.1.13',
+    invokedCommandPath: '/usr/local/bin/teamclaude',
+  });
+  assert.equal(bootstrap.nodePath, nodePath);
+  assert.equal(bootstrap.npmPath, npmPath);
+});
+
 test('launcher selection is fixed on Linux and stable on macOS', () => {
   const linux = { platform: 'linux', defaultLauncher: '/usr/local/bin/teamclaude' };
   assert.deepEqual(chooseLauncherPath({ layout: linux }), {

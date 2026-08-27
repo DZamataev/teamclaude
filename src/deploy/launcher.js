@@ -80,7 +80,8 @@ export function discoverBootstrap({
     throw new Error(`The running Node executable is not accessible: ${nodePath}`);
   }
 
-  const npmPath = findExecutable('npm', pathEnv);
+  const adjacentNpm = join(dirname(nodePath), 'npm');
+  const npmPath = isExecutable(adjacentNpm) ? adjacentNpm : findExecutable('npm', pathEnv);
   if (!npmPath || !isAbsolute(npmPath) || !isExecutable(npmPath)) {
     throw new Error('Could not find an executable npm on PATH');
   }
