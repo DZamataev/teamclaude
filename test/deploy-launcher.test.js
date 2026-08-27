@@ -73,6 +73,31 @@ test('bootstrap discovery finds npm beside NVM Node when non-interactive PATH om
   assert.equal(bootstrap.npmPath, npmPath);
 });
 
+test('bootstrap discovery classifies global npm with the selected Node when PATH omits NVM', () => {
+  const nodePath = '/root/.nvm/versions/node/v24.19.0/bin/node';
+  const npmPath = '/root/.nvm/versions/node/v24.19.0/bin/npm';
+  const bootstrap = discoverBootstrap({
+    execPath: nodePath,
+    nodeVersion: '24.19.0',
+    pathEnv: '/usr/local/bin:/usr/bin:/bin',
+    findExecutable: () => null,
+    realpath: value => value,
+    isExecutable: value => value === nodePath || value === npmPath,
+    classifyInstall: ({ globalRoot }) => globalRoot === '/root/.nvm/versions/node/v24.19.0/lib/node_modules'
+      ? 'global'
+      : 'local',
+    run: (command, argv) => command === nodePath
+      && argv.join(' ') === `${npmPath} root --global`
+      ? result(0, '/root/.nvm/versions/node/v24.19.0/lib/node_modules\n')
+      : result(127, '', 'not found'),
+    packageVersion: '1.1.13',
+    invokedCommandPath: npmPath,
+  });
+
+  assert.equal(bootstrap.installKind, 'global');
+  assert.equal(bootstrap.packageVersion, '1.1.13');
+});
+
 test('launcher selection is fixed on Linux and stable on macOS', () => {
   const linux = { platform: 'linux', defaultLauncher: '/usr/local/bin/teamclaude' };
   assert.deepEqual(chooseLauncherPath({ layout: linux }), {

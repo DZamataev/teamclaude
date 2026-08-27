@@ -62,7 +62,9 @@ export function discoverBootstrap({
   findExecutable = defaultFindExecutable,
   realpath = realpathSync,
   isExecutable = defaultIsExecutable,
-  installKind = detectInstallKind(),
+  installKind,
+  classifyInstall = detectInstallKind,
+  run = defaultRun,
   packageVersion = currentVersion(),
   invokedCommandPath = process.argv[1] ? resolve(process.argv[1]) : null,
 } = {}) {
@@ -85,7 +87,13 @@ export function discoverBootstrap({
   if (!npmPath || !isAbsolute(npmPath) || !isExecutable(npmPath)) {
     throw new Error('Could not find an executable npm on PATH');
   }
-  return { nodePath, npmPath, invokedCommandPath, installKind, packageVersion };
+  let resolvedInstallKind = installKind;
+  if (resolvedInstallKind === undefined) {
+    const rootResult = run(nodePath, [npmPath, 'root', '--global']);
+    const root = commandSucceeded(rootResult) ? String(rootResult.stdout || '').trim() : '';
+    resolvedInstallKind = classifyInstall({ globalRoot: isAbsolute(root) ? root : null });
+  }
+  return { nodePath, npmPath, invokedCommandPath, installKind: resolvedInstallKind, packageVersion };
 }
 
 function isVersionOwnedDirectory(directory) {
