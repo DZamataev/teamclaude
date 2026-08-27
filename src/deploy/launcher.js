@@ -179,7 +179,7 @@ export async function handoffLauncher({
   let warning;
   if (bootstrap.installKind === 'global') {
     const uninstallArgs = ['uninstall', '-g', PKG_NAME];
-    const uninstall = run(bootstrap.npmPath, uninstallArgs);
+    const uninstall = run(bootstrap.nodePath, [bootstrap.npmPath, ...uninstallArgs]);
     if (!commandSucceeded(uninstall)) {
       npmCleanupPending = true;
       warning = `Global npm cleanup is still pending. Run: npm uninstall -g ${PKG_NAME}`;
@@ -231,16 +231,16 @@ export async function resolveNpmRestore({
     }
   }
   const packageSpec = `${PKG_NAME}@${npmRestore.version ?? 'latest'}`;
-  const prefixResult = run(npmPath, ['prefix', '--global']);
+  const prefixResult = run(nodePath, [npmPath, 'prefix', '--global']);
   if (!commandSucceeded(prefixResult)) throw commandError(npmPath, ['prefix', '--global'], prefixResult);
   const prefix = String(prefixResult.stdout || '').trim();
   if (!isAbsolute(prefix)) throw new Error(`npm returned an invalid global prefix: ${prefix || '(empty)'}`);
-  return { packageSpec, npmPath, commandPath: join(prefix, 'bin', 'teamclaude') };
+  return { packageSpec, nodePath, npmPath, commandPath: join(prefix, 'bin', 'teamclaude') };
 }
 
 export async function restoreGlobalNpm(resolved, { run = defaultRun } = {}) {
   const installArgs = ['install', '--global', resolved.packageSpec];
-  const installed = run(resolved.npmPath, installArgs, { stdio: 'inherit' });
+  const installed = run(resolved.nodePath, [resolved.npmPath, ...installArgs], { stdio: 'inherit' });
   if (!commandSucceeded(installed)) throw commandError(resolved.npmPath, installArgs, installed);
   const verified = run(resolved.commandPath, ['version']);
   if (!commandSucceeded(verified)) throw commandError(resolved.commandPath, ['version'], verified);
