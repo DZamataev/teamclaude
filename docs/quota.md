@@ -22,6 +22,8 @@ curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/qu
 
 The optional quota probe also fills missing tier metadata on its first successful refresh. Tier metadata is persisted with observed quota in `teamclaude.state.json`, so it survives subsequent restarts.
 
+The repository includes a ready-to-install [Claude Code status-line snippet](../examples/claude-code-statusline.sh) that reads this endpoint, caches it for 15 seconds, and shows the fleet's remaining 5-hour, shared weekly, and Fable weekly capacity with reset countdowns. Installation and environment hints are in the [README](../README.md#claude-code-quota-status-line).
+
 ## Quota probe
 
 If you'd rather keep idle accounts' quota fresh, enable the background probe:

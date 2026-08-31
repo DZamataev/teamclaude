@@ -51,6 +51,37 @@ teamclaude help              # everything else
 
 Full reference: [docs/usage.md](docs/usage.md).
 
+## Claude Code quota status line
+
+The bundled [status-line snippet](examples/claude-code-statusline.sh) renders the tier-weighted fleet quota from `GET /teamclaude/quota` without a model parameter:
+
+```text
+Σ 5h 2% ↻1h30m  7d 86% ↻2d3h  F7 75% left
+```
+
+The percentages are capacity remaining, reset countdowns belong to the preceding bucket, and `F7` is the dedicated 7-day Fable bucket. Remaining capacity is green above 30%, yellow from 10–30%, and red below 10%.
+
+Install the snippet shipped by the global npm package:
+
+```bash
+mkdir -p ~/.claude
+install -m 755 "$(npm root -g)/@karpeleslab/teamclaude/examples/claude-code-statusline.sh" \
+  ~/.claude/teamclaude-statusline.sh
+```
+
+Then add this field to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"$HOME/.claude/teamclaude-statusline.sh\""
+  }
+}
+```
+
+The snippet defaults to `http://127.0.0.1:3456`, caches the response for 15 seconds, and stays silent if TeamClaude is unavailable. For a remote proxy, export `TEAMCLAUDE_BASE_URL` and `TEAMCLAUDE_API_KEY`; it also falls back to the existing `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. Set `TEAMCLAUDE_QUOTA_CACHE` to move the cache or `NO_COLOR=1` to disable ANSI colors. The snippet intentionally prints only TeamClaude quota, so it can be used alone or copied into a larger status-line script.
+
 ## Configuration
 
 Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it, safe to delete since quota gets re-learned from traffic.
