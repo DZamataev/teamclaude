@@ -474,7 +474,10 @@ async function serverCommand() {
   quotaSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober = new Prober(accountManager, {
+    intervalMs: (config.quotaProbeSeconds || 0) * 1000,
+    profileFn: fetchProfile,
+  });
   prober.start();
 
   // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
@@ -1002,6 +1005,9 @@ async function accountsCommand() {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
       if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+      }
     }
     const uuid = a.accountUuid;
     if (!uuid) continue;
@@ -1630,6 +1636,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     accountUuid: profile?.accountUuid || null,
     orgUuid: profile?.orgUuid || null,
     orgName: profile?.orgName || null,
+    organizationType: profile?.organizationType || null,
+    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+    seatTier: profile?.seatTier || null,
+    hasClaudeMax: profile?.hasClaudeMax ?? null,
+    hasClaudePro: profile?.hasClaudePro ?? null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -1719,6 +1730,9 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+      if (diskAcct[field] != null) mgr[field] = diskAcct[field];
+    }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.

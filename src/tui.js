@@ -896,6 +896,11 @@ export class TUI {
         accountUuid: profile?.accountUuid || null,
         orgUuid: profile?.orgUuid || null,
         orgName: profile?.orgName || null,
+        organizationType: profile?.organizationType || null,
+        rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+        seatTier: profile?.seatTier || null,
+        hasClaudeMax: profile?.hasClaudeMax ?? null,
+        hasClaudePro: profile?.hasClaudePro ?? null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -919,6 +924,9 @@ export class TUI {
           amAcct.accountUuid = entry.accountUuid;
           amAcct.orgUuid = entry.orgUuid;
           amAcct.orgName = entry.orgName;
+          for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+            amAcct[field] = entry[field];
+          }
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
