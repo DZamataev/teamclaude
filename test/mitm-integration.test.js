@@ -342,13 +342,17 @@ test('MITM h2: a cancelled request stops before spending another account', T, as
     res.end('{}');
   });
   const upPort = await listen(upstream);
+  let markRequestEnded;
+  const requestEnded = new Promise(resolve => { markRequestEnded = resolve; });
   const am = new AccountManager(
     ['a', 'b', 'c', 'd'].map((name, index) => oauthAccount(name, `t-${name}`, {
       accountUuid: `${ACCOUNT_UUID.slice(0, -1)}${index}`,
     })),
     0.98,
   );
-  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem }, {
+    hooks: { onRequestEnd: markRequestEnded },
+  });
   const proxyPort = await listen(proxy);
 
   let client;
@@ -366,20 +370,13 @@ test('MITM h2: a cancelled request stops before spending another account', T, as
     await firstAttemptArrived;
     stream.close(http2.constants.NGHTTP2_CANCEL);
 
-    const settleMs = 400;
-    const capMs = 15_000;
-    const startedAt = Date.now();
-    let lastCount = -1;
-    let lastChange = Date.now();
-    while (Date.now() - startedAt < capMs) {
-      if (hits.length !== lastCount) {
-        lastCount = hits.length;
-        lastChange = Date.now();
-      } else if (Date.now() - lastChange >= settleMs) {
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
+    let timeout;
+    await Promise.race([
+      requestEnded,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('proxy request handler did not return')), 15_000);
+      }),
+    ]).finally(() => clearTimeout(timeout));
   } finally {
     try { client?.destroy(); } catch { /* already closed */ }
     closeHard(proxy);
@@ -487,13 +484,13 @@ function runCancelledSseScenario() {
       }, 50);
     });
     stop = true;
-    process.stdout.write(JSON.stringify({
+    const result = JSON.stringify({
       sawChunk,
       started: started.length,
       ended: ended.length,
       returned,
-    }));
-    process.exit(0);
+    });
+    process.stdout.write(result, () => process.exit(0));
   `;
 
   return new Promise(resolve => {
@@ -501,15 +498,21 @@ function runCancelledSseScenario() {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const output = [];
+    const errors = [];
     child.stdout.on('data', chunk => output.push(String(chunk)));
-    child.stderr.on('data', () => {});
+    child.stderr.on('data', chunk => errors.push(String(chunk)));
     const kill = setTimeout(() => child.kill('SIGKILL'), 25_000);
-    child.on('close', () => {
+    child.on('close', (code, signal) => {
       clearTimeout(kill);
       try {
         resolve(JSON.parse(output.join('')));
       } catch {
-        resolve({ error: output.join('') || 'child produced no result' });
+        resolve({
+          error: output.join('') || 'child produced no result',
+          stderr: errors.join(''),
+          code,
+          signal,
+        });
       }
     });
   });
