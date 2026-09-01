@@ -5,6 +5,8 @@ import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
 import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -318,4 +320,205 @@ test('tunnel: upstream connect failure returns 502, not a silent drop', T, async
   } finally {
     closeHard(proxy);
   }
+});
+
+test('MITM h2: a cancelled request stops before spending another account', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const hits = [];
+  let markFirstAttemptArrived;
+  const firstAttemptArrived = new Promise(resolve => { markFirstAttemptArrived = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    hits.push(req.headers.authorization || 'none');
+    if (hits.length === 1) {
+      markFirstAttemptArrived();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    res.writeHead(429, {
+      'content-type': 'application/json',
+      'retry-after': '1',
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+    });
+    res.end('{}');
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager(
+    ['a', 'b', 'c', 'd'].map((name, index) => oauthAccount(name, `t-${name}`, {
+      accountUuid: `${ACCOUNT_UUID.slice(0, -1)}${index}`,
+    })),
+    0.98,
+  );
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  let client;
+  try {
+    const sock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
+    client = http2.connect(`https://localhost:${upPort}`, { createConnection: () => sock });
+    const stream = client.request({
+      ':method': 'POST',
+      ':path': '/v1/messages',
+      'content-type': 'application/json',
+    });
+    stream.on('error', () => {});
+    stream.end(JSON.stringify({ model: 'claude-opus-5', messages: [] }));
+
+    await firstAttemptArrived;
+    stream.close(http2.constants.NGHTTP2_CANCEL);
+
+    const settleMs = 400;
+    const capMs = 15_000;
+    const startedAt = Date.now();
+    let lastCount = -1;
+    let lastChange = Date.now();
+    while (Date.now() - startedAt < capMs) {
+      if (hits.length !== lastCount) {
+        lastCount = hits.length;
+        lastChange = Date.now();
+      } else if (Date.now() - lastChange >= settleMs) {
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  } finally {
+    try { client?.destroy(); } catch { /* already closed */ }
+    closeHard(proxy);
+    closeHard(upstream);
+  }
+
+  assert.ok(hits.length >= 1, 'the request never reached upstream');
+  assert.equal(hits.length, 1,
+    `the cancelled request spent ${hits.length} of ${am.accounts.length} accounts`);
+});
+
+const X509_PATH = fileURLToPath(new URL('../src/x509.js', import.meta.url));
+const MITM_PATH = fileURLToPath(new URL('../src/mitm.js', import.meta.url));
+const ACCOUNT_MANAGER_PATH = fileURLToPath(new URL('../src/account-manager.js', import.meta.url));
+
+function runCancelledSseScenario() {
+  const source = `
+    import http from 'node:http';
+    import http2 from 'node:http2';
+    import { generateCertChain } from ${JSON.stringify(X509_PATH)};
+    import { createConnectHandler } from ${JSON.stringify(MITM_PATH)};
+    import { AccountManager } from ${JSON.stringify(ACCOUNT_MANAGER_PATH)};
+
+    console.log = () => {};
+    console.error = () => {};
+    const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+    const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+    let stop = false;
+    const upstream = http.createServer(async (req, res) => {
+      for await (const chunk of req) void chunk;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      for (let index = 0; !stop && index < 200; index += 1) {
+        res.write('data: {"n":' + index + '}\\n\\n');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      res.end();
+    });
+    const upstreamPort = await listen(upstream);
+
+    const started = [];
+    const ended = [];
+    const accountManager = new AccountManager([{
+      name: 'a',
+      type: 'oauth',
+      accessToken: 't-a',
+      refreshToken: 'r',
+      expiresAt: Date.now() + 3600000,
+    }], 0.98);
+    const proxy = http.createServer();
+    proxy.on('connect', createConnectHandler({
+      config: { upstream: 'http://127.0.0.1:' + upstreamPort },
+      accountManager,
+      ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
+      hooks: {
+        onRequestStart: id => started.push(id),
+        onRequestEnd: id => ended.push(id),
+      },
+    }));
+    const proxyPort = await listen(proxy);
+
+    const net = await import('node:net');
+    const tls = await import('node:tls');
+    const raw = net.connect(proxyPort, '127.0.0.1');
+    await new Promise(resolve => raw.once('connect', resolve));
+    raw.write('CONNECT 127.0.0.1:' + upstreamPort + ' HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n');
+    await new Promise(resolve => raw.once('data', resolve));
+    const socket = tls.connect({
+      socket: raw,
+      ca: caCertPem,
+      servername: 'localhost',
+      ALPNProtocols: ['h2'],
+    });
+    await new Promise(resolve => socket.once('secureConnect', resolve));
+
+    const client = http2.connect('https://localhost:' + upstreamPort, { createConnection: () => socket });
+    client.on('error', () => {});
+    const stream = client.request({
+      ':method': 'POST',
+      ':path': '/v1/messages',
+      'content-type': 'application/json',
+    });
+    stream.on('error', () => {});
+    stream.end(JSON.stringify({ model: 'claude-opus-5', messages: [], stream: true }));
+
+    let sawChunk = false;
+    await new Promise(resolve => {
+      stream.on('data', () => {
+        if (!sawChunk) {
+          sawChunk = true;
+          resolve();
+        }
+      });
+      setTimeout(resolve, 6000);
+    });
+    stream.close(http2.constants.NGHTTP2_CANCEL);
+
+    const returned = await new Promise(resolve => {
+      const deadline = setTimeout(() => resolve(false), 8000);
+      const poll = setInterval(() => {
+        if (started.length > 0 && ended.length >= started.length) {
+          clearTimeout(deadline);
+          clearInterval(poll);
+          resolve(true);
+        }
+      }, 50);
+    });
+    stop = true;
+    process.stdout.write(JSON.stringify({
+      sawChunk,
+      started: started.length,
+      ended: ended.length,
+      returned,
+    }));
+    process.exit(0);
+  `;
+
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const output = [];
+    child.stdout.on('data', chunk => output.push(String(chunk)));
+    child.stderr.on('data', () => {});
+    const kill = setTimeout(() => child.kill('SIGKILL'), 25_000);
+    child.on('close', () => {
+      clearTimeout(kill);
+      try {
+        resolve(JSON.parse(output.join('')));
+      } catch {
+        resolve({ error: output.join('') || 'child produced no result' });
+      }
+    });
+  });
+}
+
+test('MITM h2: cancelling an SSE stream lets the request handler return', { ...T, timeout: 60_000 }, async () => {
+  const result = await runCancelledSseScenario();
+  assert.ok(result.sawChunk, `the stream delivered nothing before cancellation: ${JSON.stringify(result)}`);
+  assert.ok(result.started > 0, `no request activity started: ${JSON.stringify(result)}`);
+  assert.ok(result.returned,
+    `the cancelled stream stranded its request handler: ${JSON.stringify(result)}`);
 });

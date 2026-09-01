@@ -388,6 +388,11 @@ export function relayHttpForward(req, res) {
 
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
 
+/** Return whether the HTTP/1 response or its underlying HTTP/2 stream has closed. */
+function clientGone(res) {
+  return !!res.destroyed || !!res.stream?.destroyed;
+}
+
 /**
  * Build the core proxy request listener — buffer the body, then forward with
  * account selection + retry (forwardRequest). Shared by the base HTTP server and
@@ -419,8 +424,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // rather than per-account: it is a property of the connection, and this is
       // the one path every request takes, MITM included.
       if (egress?.enabled()) {
-        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
-        if (res.destroyed) return;
+        const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
+        if (clientGone(res)) return;
         if (!state.ok) {
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
@@ -883,7 +888,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -892,7 +897,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -986,7 +991,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => clientGone(res))) return;
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1047,7 +1052,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1075,7 +1080,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1085,7 +1090,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1094,7 +1099,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // The pause above keeps other requests off this account meanwhile.
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
-      if (!res.headersSent && !res.destroyed) {
+      if (!res.headersSent && !clientGone(res)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
@@ -1137,7 +1142,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1302,7 +1307,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       if (done) break;
 
       // Client disconnected — stop reading from upstream
-      if (res.destroyed) break;
+      if (clientGone(res)) break;
 
       // Forward chunk immediately
       const ok = res.write(value);
@@ -1332,7 +1337,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
           res.once('drain', done);
           res.once('close', done);
         });
-        if (res.destroyed) break;
+        if (clientGone(res)) break;
       }
     }
 
