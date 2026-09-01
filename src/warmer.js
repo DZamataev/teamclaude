@@ -187,6 +187,15 @@ export class Warmer {
     this._record(account, { status: 'running', startedAt });
     try {
       await this.am.ensureTokenFresh(account.index);
+      if (account.status === 'error') {
+        const finishedAt = Date.now();
+        this._record(account, {
+          status: 'error',
+          error: 'token refresh rejected; re-login required',
+          startedAt, finishedAt, durationMs: finishedAt - startedAt,
+        });
+        return;
+      }
       const code = await this.spawnFn(this._spawnSpec(account, signal));
       const finishedAt = Date.now();
       this._record(account, {

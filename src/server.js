@@ -602,6 +602,8 @@ function relayStream(req, res, upstream, sx) {
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
+    upstreamRes.on('aborted', () => res.destroy());
+    upstreamRes.on('error', () => res.destroy());
   });
 
   upstreamReq.on('error', (err) => {
@@ -609,6 +611,8 @@ function relayStream(req, res, upstream, sx) {
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    } else {
+      res.destroy();
     }
   });
   // Client disconnected (e.g. Claude Code closed the channel): tear down the
@@ -757,6 +761,47 @@ function formatHeaders(headers) {
     return [...headers.entries()].map(([k, v]) => `  ${k}: ${v}`).join('\n');
   }
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+}
+
+// Socket-scoped failures say nothing about the selected account. A reconnect
+// can help; walking the fleet cannot.
+const SOCKET_TRANSIENT = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'TEAMCLAUDE_HEADERS_TIMEOUT', 'TEAMCLAUDE_BODY_TIMEOUT',
+]);
+
+// Host-scoped failures are shared by accounts dialing the same hostname, but an
+// account with its own upstream on another host can still serve the request.
+const HOST_TRANSIENT = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN',
+]);
+
+function errorCodes(error) {
+  const codes = [];
+  const visited = new Set();
+  const visit = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function') || visited.has(value)) return;
+    visited.add(value);
+    if (value.code) codes.push(value.code);
+    visit(value.cause);
+    if (Array.isArray(value.errors)) {
+      for (const child of value.errors) visit(child);
+    }
+  };
+  visit(error);
+  return codes;
+}
+
+export function isTransientUpstreamError(error, { otherHostAvailable = false } = {}) {
+  if (!(error instanceof Error)) return false;
+  if (error.name === 'TimeoutError' || error.name === 'AbortError') return true;
+  const codes = errorCodes(error);
+  if (codes.some(code => SOCKET_TRANSIENT.has(code))) return true;
+  if (codes.some(code => HOST_TRANSIENT.has(code))) return !otherHostAvailable;
+  // Global fetch reports a generic wrapper and stores the useful code in
+  // `cause`, so this fallback must run only after nested codes are considered.
+  return typeof error.message === 'string' && error.message.includes('fetch failed');
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
@@ -1147,13 +1192,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
-    const isTransient = err instanceof Error &&
-      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
-        err.name === 'TimeoutError' || err.name === 'AbortError' ||
-        err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+    const hostOf = value => {
+      try { return new URL(value).hostname; } catch { return value; }
+    };
+    const currentHost = hostOf(account.upstream || upstream);
+    const alternateHostAvailable = accountManager.accounts.some(candidate =>
+      candidate.index !== account.index && !ctx.tried.has(candidate.index) &&
+      hostOf(candidate.upstream || upstream) !== currentHost &&
+      accountManager._isAvailable(candidate, ctx.model));
+    const isTransient = isTransientUpstreamError(err, {
+      otherHostAvailable: ctx.pinnedIndex != null || alternateHostAvailable,
+    });
 
     // Transient network errors (including a stale-socket headers/body timeout):
     // close the connection and let the client retry. Failing over to another
@@ -1164,6 +1213,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (isTransient) {
       res.destroy();
       return;
+    }
+
+    if (alternateHostAvailable && errorCodes(err).some(code => HOST_TRANSIENT.has(code))) {
+      for (const candidate of accountManager.accounts) {
+        if (hostOf(candidate.upstream || upstream) === currentHost) ctx.tried.add(candidate.index);
+      }
     }
 
     // Any other thrown error is a transport/stream failure, NOT proof the

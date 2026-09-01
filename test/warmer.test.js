@@ -61,6 +61,23 @@ test('errored and exhausted accounts are skipped', async () => {
   assert.equal(spawn.calls.length, 0);
 });
 
+test('a refresh rejection does not launch a warm-up request with the stale access token', async () => {
+  const refreshFn = async () => {
+    const error = new Error('invalid_grant');
+    error.status = 400;
+    throw error;
+  };
+  const am = new AccountManager([
+    oauth('expired', { expiresAt: Date.now() - 1000 }),
+  ], 0.98, { refreshFn });
+  const spawn = fakeSpawner();
+
+  await makeWarmer(am, spawn).warmAll();
+
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(spawn.calls.length, 0);
+});
+
 // ── spawn spec ───────────────────────────────────────────────────────────────
 
 test('the spawn invocation is a minimal non-interactive claude pinned to the account', async () => {

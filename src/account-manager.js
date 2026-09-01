@@ -94,6 +94,9 @@ function makeAccount(acct, index) {
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
     _lastRefreshAt: null,
+    // A token rejected by the OAuth endpoint stays unusable until it changes or
+    // the operator explicitly asks to retry the account.
+    _deadRefreshToken: null,
   };
 }
 
@@ -1151,6 +1154,7 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -1237,6 +1241,8 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
+    if (account._deadRefreshToken === account.refreshToken) return;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -1257,14 +1263,16 @@ export class AccountManager {
     // Coalesce concurrent refreshes
     if (account._refreshPromise) return account._refreshPromise;
 
+    const attemptedRefreshToken = account.refreshToken;
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await this._refreshFn(account.refreshToken);
+        const newTokens = await this._refreshFn(attemptedRefreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
+        account._deadRefreshToken = null;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -1276,8 +1284,9 @@ export class AccountManager {
         // account: keep its current token and retry on the next request. This is
         // what kept accounts wrongly "errored" after a momentary refresh blip.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
-        if (isAuthRejection) {
+        if (isAuthRejection && account.refreshToken === attemptedRefreshToken) {
           account.status = 'error';
+          account._deadRefreshToken = attemptedRefreshToken;
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {

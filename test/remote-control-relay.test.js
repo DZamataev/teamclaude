@@ -192,3 +192,41 @@ test('an upstream socket that dies mid-relay tears down the pair instead of cras
     upstream.close();
   }
 });
+
+test('a mid-response upstream failure closes the Remote Control client stream', async () => {
+  const { server: upstream, port: upstreamPort } = await listen((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: hello\n\n');
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+  const accountManager = {
+    getActiveAccount() {
+      throw new Error('Remote Control relay must not rotate accounts');
+    },
+  };
+  const listener = createProxyRequestListener({
+    accountManager,
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const { server: proxy, port } = await listen(listener);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/code/sessions/abc/worker/events/stream`);
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.match(Buffer.from(first.value).toString(), /event: hello/);
+
+    let timeout;
+    const outcome = await Promise.race([
+      reader.read().then(({ done }) => done ? 'closed' : 'data', () => 'closed'),
+      new Promise(resolve => { timeout = setTimeout(() => resolve('stranded'), 2000); }),
+    ]);
+    clearTimeout(timeout);
+    assert.equal(outcome, 'closed');
+  } finally {
+    proxy.close();
+    upstream.close();
+    upstream.closeAllConnections();
+  }
+});
