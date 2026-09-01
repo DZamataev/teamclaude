@@ -56,10 +56,11 @@ Full reference: [docs/usage.md](docs/usage.md).
 The bundled [status-line snippet](examples/claude-code-statusline.sh) renders the tier-weighted fleet quota from `GET /teamclaude/quota` without a model parameter:
 
 ```text
-Σ 5h 2% ↻1h30m  7d 86% ↻2d3h  F7 75% left
+Σ 5h [██████████████░░░░] 22% │ 7d [███░░░░░░░░░░░░░░░] 86% │ F7d 75% left
+  Team 5h 2% ↻1h30m · 7d 86% ↻2d3h │ Max5 5h 25% ↻2h40m · 7d 93% ↻6d16h · F7d 100%
 ```
 
-The percentages are capacity remaining, reset countdowns belong to the preceding bucket, and `F7` is the dedicated 7-day Fable bucket. Remaining capacity is green above 30%, yellow from 10–30%, and red below 10%.
+The first line shows tier-weighted 5-hour and shared weekly usage as RGB-gradient progress bars in the style of `teamclaude status`; the percentage beside each bar is capacity remaining. Fable stays compact as a remaining percentage. The second line shows each contributing subscription tier and its own reset countdown, so the fleet's earliest reset is not mistaken for a full reset. `F7d` is the dedicated 7-day Fable bucket; a per-account Fable value is omitted when it merely falls back to that account's shared `7d` bucket. Remaining percentages are green above 30%, yellow from 10–30%, and red below 10%.
 
 Install the snippet shipped by the global npm package:
 

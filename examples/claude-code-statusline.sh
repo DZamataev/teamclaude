@@ -5,10 +5,10 @@ cat >/dev/null
 umask 077
 
 if [ -n "${NO_COLOR:-}" ]; then
-    RESET=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''
+    RESET=''; BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; USE_COLOR=0
 else
-    RESET='\033[0m'; DIM='\033[2m'; RED='\033[31m'
-    GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'
+    RESET='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'; RED='\033[31m'
+    GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; USE_COLOR=1
 fi
 
 quota_color() {
@@ -21,6 +21,37 @@ quota_percent() {
     local percent
     percent=$(awk -v value="$1" 'BEGIN {printf "%.0f", value * 100}')
     printf '%b%s%%%b' "$(quota_color "$percent")" "$percent" "$RESET"
+}
+
+usage_bar() {
+    awk -v remaining="$1" -v color="$USE_COLOR" 'BEGIN {
+        width = 18
+        remaining = remaining + 0
+        if (remaining < 0) remaining = 0
+        if (remaining > 1) remaining = 1
+        filled = int((1 - remaining) * width + 0.5)
+        printf "["
+        for (i = 0; i < filled; i++) {
+            t = width <= 1 ? 1 : i / (width - 1)
+            if (t < 0.5) {
+                p = t * 2
+                r = int(35 + (245 - 35) * p + 0.5)
+                g = int(209 + (185 - 209) * p + 0.5)
+                b = int(96 + (40 - 96) * p + 0.5)
+            } else {
+                p = (t - 0.5) * 2
+                r = int(245 + (239 - 245) * p + 0.5)
+                g = int(185 + (68 - 185) * p + 0.5)
+                b = int(40 + (68 - 40) * p + 0.5)
+            }
+            if (color) printf "\033[38;2;%d;%d;%dm", r, g, b
+            printf "█"
+        }
+        if (color && filled < width) printf "\033[90m"
+        for (i = filled; i < width; i++) printf "░"
+        if (color) printf "\033[0m"
+        printf "]"
+    }'
 }
 
 reset_in() {
@@ -81,20 +112,53 @@ fi
 [ -n "$quota_file" ] || exit 0
 
 five_hour=$(jq -r '.aggregate.fiveHour.remaining // empty' "$quota_file" 2>/dev/null)
-five_hour_reset=$(jq -r '.aggregate.fiveHour.nextResetAt // empty' "$quota_file" 2>/dev/null)
 weekly=$(jq -r '.aggregate.weeklyShared.remaining // empty' "$quota_file" 2>/dev/null)
-weekly_reset=$(jq -r '.aggregate.weeklyShared.nextResetAt // empty' "$quota_file" 2>/dev/null)
 fable=$(jq -r '.aggregate.weeklyFable.remaining // empty' "$quota_file" 2>/dev/null)
 
-output=''
+aggregate_output=''
 if [ -n "$five_hour" ]; then
-    countdown=$(reset_in "$five_hour_reset")
-    output="5h $(quota_percent "$five_hour")${countdown:+ $countdown}"
+    aggregate_output="5h $(usage_bar "$five_hour") $(quota_percent "$five_hour")"
 fi
 if [ -n "$weekly" ]; then
-    countdown=$(reset_in "$weekly_reset")
-    output="${output:+$output  }7d $(quota_percent "$weekly")${countdown:+ $countdown}"
+    aggregate_output="${aggregate_output:+$aggregate_output ${DIM}│${RESET} }7d $(usage_bar "$weekly") $(quota_percent "$weekly")"
 fi
-[ -n "$fable" ] && output="${output:+$output  }F7 $(quota_percent "$fable")"
+[ -n "$fable" ] && aggregate_output="${aggregate_output:+$aggregate_output ${DIM}│${RESET} }F7d $(quota_percent "$fable")"
 
-[ -n "$output" ] && printf '%bΣ%b %b left\n' "$CYAN" "$RESET" "$output"
+accounts_output=''
+while IFS= read -r account; do
+    label=$(jq -r '
+        if (.tier.seatTier // "") == "team_standard" then "Team"
+        elif (.tier.rateLimitTier // "") | test("_max_[0-9]+x$") then
+            "Max" + ((.tier.rateLimitTier | capture("_max_(?<multiple>[0-9]+)x$")).multiple)
+        else .name
+        end
+    ' <<<"$account" 2>/dev/null)
+    account_five=$(jq -r '.buckets.fiveHour.remaining // empty' <<<"$account" 2>/dev/null)
+    account_five_reset=$(jq -r '.buckets.fiveHour.resetAt // empty' <<<"$account" 2>/dev/null)
+    account_weekly=$(jq -r '.buckets.weeklyShared.remaining // empty' <<<"$account" 2>/dev/null)
+    account_weekly_reset=$(jq -r '.buckets.weeklyShared.resetAt // empty' <<<"$account" 2>/dev/null)
+    account_fable=$(jq -r '.buckets.weeklyFable.remaining // empty' <<<"$account" 2>/dev/null)
+    account_fable_reset=$(jq -r '.buckets.weeklyFable.resetAt // empty' <<<"$account" 2>/dev/null)
+    account_fable_source=$(jq -r '.buckets.weeklyFable.source // empty' <<<"$account" 2>/dev/null)
+
+    account_cells=''
+    if [ -n "$account_five" ]; then
+        countdown=$(reset_in "$account_five_reset")
+        account_cells="5h $(quota_percent "$account_five")${countdown:+ $countdown}"
+    fi
+    if [ -n "$account_weekly" ]; then
+        countdown=$(reset_in "$account_weekly_reset")
+        account_cells="${account_cells:+$account_cells ${DIM}·${RESET} }7d $(quota_percent "$account_weekly")${countdown:+ $countdown}"
+    fi
+    if [ -n "$account_fable" ] && [ "$account_fable_source" = "unified7dFable" ]; then
+        countdown=$(reset_in "$account_fable_reset")
+        account_cells="${account_cells:+$account_cells ${DIM}·${RESET} }F7d $(quota_percent "$account_fable")${countdown:+ $countdown}"
+    fi
+    [ -z "$account_cells" ] && continue
+    accounts_output="${accounts_output:+$accounts_output ${DIM}│${RESET} }${BOLD}${label}${RESET} ${account_cells}"
+done < <(jq -c '.accounts[]? | select(.disabled != true)' "$quota_file" 2>/dev/null)
+
+if [ -n "$aggregate_output" ]; then
+    printf '%bΣ%b %b left\n' "$CYAN" "$RESET" "$aggregate_output"
+    [ -n "$accounts_output" ] && printf '  %b\n' "$accounts_output"
+fi

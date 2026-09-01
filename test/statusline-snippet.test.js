@@ -39,9 +39,9 @@ async function quotaServer(payload) {
   };
 }
 
-function fleetQuota({ fiveHour, weekly, fable, fiveHourReset = null, weeklyReset = null }) {
+function fleetQuota({ fiveHour, weekly, fable, fiveHourReset = null, weeklyReset = null, accounts = [] }) {
   return {
-    accounts: [],
+    accounts,
     aggregate: {
       fiveHour: { remaining: fiveHour, nextResetAt: fiveHourReset },
       weeklyShared: { remaining: weekly, nextResetAt: weeklyReset },
@@ -52,14 +52,40 @@ function fleetQuota({ fiveHour, weekly, fable, fiveHourReset = null, weeklyReset
   };
 }
 
-test('statusline snippet renders five-hour and weekly reset countdowns', async t => {
+test('statusline snippet renders fleet bars and per-account quota on separate lines', async t => {
   const now = Date.now();
   const endpoint = await quotaServer(fleetQuota({
-    fiveHour: 0.02,
+    fiveHour: 0.22,
     weekly: 0.86,
     fable: 0.75,
     fiveHourReset: now + 90 * 60 * 1000,
     weeklyReset: now + 51 * 60 * 60 * 1000,
+    accounts: [
+      {
+        name: 'dz@example.com (Team)',
+        type: 'oauth',
+        disabled: false,
+        status: 'active',
+        tier: { rateLimitTier: 'default_raven', seatTier: 'team_standard', weight: 1 },
+        buckets: {
+          fiveHour: { remaining: 0.02, resetAt: now + 90 * 60 * 1000, source: 'unified5h' },
+          weeklyShared: { remaining: 0.86, resetAt: now + 51 * 60 * 60 * 1000, source: 'unified7d' },
+          weeklyFable: { remaining: 0.86, resetAt: now + 51 * 60 * 60 * 1000, source: 'unified7d' },
+        },
+      },
+      {
+        name: 'dz@example.com (Personal)',
+        type: 'oauth',
+        disabled: false,
+        status: 'active',
+        tier: { rateLimitTier: 'default_claude_max_5x', seatTier: null, weight: 5 },
+        buckets: {
+          fiveHour: { remaining: 0.25, resetAt: now + 160 * 60 * 1000, source: 'unified5h' },
+          weeklyShared: { remaining: 0.93, resetAt: now + 160 * 60 * 60 * 1000, source: 'unified7d' },
+          weeklyFable: { remaining: 1, resetAt: null, source: 'unified7dFable' },
+        },
+      },
+    ],
   }));
   const temp = await mkdtemp(path.join(os.tmpdir(), 'teamclaude-statusline-'));
   t.after(async () => {
@@ -75,11 +101,30 @@ test('statusline snippet renders five-hour and weekly reset countdowns', async t
   });
 
   assert.equal(result.code, 0, result.stderr);
-  assert.equal(result.stdout.trim(), 'Σ 5h 2% ↻1h30m  7d 86% ↻2d3h  F7 75% left');
+  assert.equal(result.stdout.trim(), [
+    'Σ 5h [██████████████░░░░] 22% │ 7d [███░░░░░░░░░░░░░░░] 86% │ F7d 75% left',
+    '  Team 5h 2% ↻1h30m · 7d 86% ↻2d3h │ Max5 5h 25% ↻2h40m · 7d 93% ↻6d16h · F7d 100%',
+  ].join('\n'));
 });
 
-test('statusline snippet colors remaining capacity by risk', async t => {
-  const endpoint = await quotaServer(fleetQuota({ fiveHour: 0.02, weekly: 0.20, fable: 0.75 }));
+test('statusline snippet fills bars by usage with the status risk gradient', async t => {
+  const endpoint = await quotaServer(fleetQuota({
+    fiveHour: 0.20,
+    weekly: 0,
+    fable: 1,
+    accounts: [{
+      name: 'account',
+      type: 'oauth',
+      disabled: false,
+      status: 'active',
+      tier: { rateLimitTier: 'default_claude_max_5x', seatTier: null, weight: 5 },
+      buckets: {
+        fiveHour: { remaining: 0.02, resetAt: null, source: 'unified5h' },
+        weeklyShared: { remaining: 0.20, resetAt: null, source: 'unified7d' },
+        weeklyFable: { remaining: 0.75, resetAt: null, source: 'unified7dFable' },
+      },
+    }],
+  }));
   const temp = await mkdtemp(path.join(os.tmpdir(), 'teamclaude-statusline-'));
   t.after(async () => {
     await endpoint.close();
@@ -95,7 +140,13 @@ test('statusline snippet colors remaining capacity by risk', async t => {
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /\x1b\[36mΣ\x1b\[0m/);
+  assert.match(result.stdout, /\x1b\[38;2;35;209;96m█/);
+  assert.match(result.stdout, /\x1b\[38;2;239;68;68m█/);
+  assert.match(result.stdout, /\x1b\[90m░/);
   assert.match(result.stdout, /\x1b\[31m2%\x1b\[0m/);
   assert.match(result.stdout, /\x1b\[33m20%\x1b\[0m/);
   assert.match(result.stdout, /\x1b\[32m75%\x1b\[0m/);
+  assert.doesNotMatch(result.stdout, /F7d\s+\[/);
+  assert.doesNotMatch(result.stdout, /\bF7\b/);
+  assert.match(result.stdout, /\bF7d\b/);
 });
