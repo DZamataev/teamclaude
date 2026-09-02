@@ -2,14 +2,14 @@ import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, writeSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
-import { BodyWriter } from './request-log.js';
+import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
@@ -204,6 +204,27 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const egress = createEgressGuard(config, console.error);
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
   const server = http.createServer(requestHandler);
+
+  // What bounds a directory of one-shot dumps is deleting the expired ones, not
+  // rotating a growing file. Swept once at startup, because a backlog is usually
+  // already sitting behind the restart that enables this, then on a timer. The
+  // interval is unref'd so it never holds the process open.
+  if (logDir) {
+    const sweep = () => {
+      // The message names the setting that stops it: the proxy self-updates, so
+      // the first sweep can arrive with a release the operator never read about.
+      const hours = resolveLogRetentionHours(config);
+      return sweepRequestLogs(logDir, hours)
+        .then((n) => {
+          if (n) console.log(`[TeamClaude] Removed ${n} expired request log(s) from ${logDir} (logRetentionHours=${hours}, set 0 to keep them)`);
+        })
+        .catch(() => {});
+    };
+    sweep();
+    const sweepTimer = setInterval(sweep, LOG_SWEEP_INTERVAL_MS);
+    sweepTimer.unref();
+    server.on('close', () => clearInterval(sweepTimer));
+  }
 
   // Forward-proxy support (always on, so multiple claude instances can use
   // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
@@ -548,7 +569,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -871,12 +892,109 @@ function logTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
+// How much of each request the `logDir` log records. 'body' is what the logger
+// has always done; 'headers' drops both body sections, which is the difference
+// between a kilobyte and a megabyte per request.
+const LOG_LEVELS = new Set(['off', 'headers', 'body']);
+const DEFAULT_LOG_LEVEL = 'body';
+
+export function resolveLogLevel(config) {
+  const level = config?.logLevel;
+  return LOG_LEVELS.has(level) ? level : DEFAULT_LOG_LEVEL;
+}
+
+// Bodies are what make the log large, and a cap bounds nothing unless it
+// actually applies: at 256 KiB the kept head and tail are each larger than
+// anyone reads by eye, while a request log stops scaling with the context the
+// request carried. 0 opts out, as with the other bounding settings.
+const DEFAULT_LOG_MAX_BODY_BYTES = 262_144;
+
+export function resolveLogMaxBodyBytes(config) {
+  const raw = config?.logMaxBodyBytes;
+  // A quoted number in hand-edited JSON is a common slip, so read it. A blank
+  // string is not a number and means "unset", which must reach the default:
+  // Number('') is 0, and 0 here would be the unbounded logging this bounds.
+  // Number() on null or true would likewise read as 0 and 1 rather than junk.
+  const max = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (max === 0) return 0;
+  return Number.isFinite(max) && max > 0 ? max : DEFAULT_LOG_MAX_BODY_BYTES;
+}
+
+// The names openRequestLog writes, and nothing else. Deletion keys off this
+// pattern rather than off mtime so a file the logger did not create cannot
+// match: the directory is one the operator named, and may hold anything.
+const LOG_FILE_RE = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.(\d{3})_\d{5,}\.log$/;
+const LOG_SWEEP_INTERVAL_MS = 10 * 60_000;
+const DEFAULT_LOG_RETENTION_HOURS = 72;
+
+export function resolveLogRetentionHours(config) {
+  const raw = config?.logRetentionHours;
+  // Strings only, and it matters most here: this is the setting that deletes.
+  // A quoted "0" must mean "keep everything" rather than falling back to the
+  // default and deleting, and a quoted "720" must not silently become 72. A
+  // blank string means "unset" and reaches the default, since Number('') is 0.
+  // Number() on null or true would instead read as 0 and 1.
+  const hours = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (hours === 0) return 0;
+  return Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_LOG_RETENTION_HOURS;
+}
+
+/**
+ * Delete expired request logs from `logDir`, returning how many were removed.
+ *
+ * Candidates come from the filename, which openRequestLog stamps in local time,
+ * so the scan costs one readdir and no stat for everything it skips — it has to
+ * stay cheap over a directory holding tens of thousands of files. Anything that
+ * is not a file, not name-matched, or inside a subdirectory is left alone.
+ *
+ * Only names already past the cutoff are stat'd, and mtime has to agree before
+ * the unlink. The name's clock is local, so a machine that changes timezone (a
+ * laptop does it by itself) can age a file by hours; mtime is absolute. Every
+ * disagreement between the two therefore keeps the file, which is the bias this
+ * operation needs — including for a file still being appended to, whose mtime
+ * is fresh however old its name looks.
+ */
+export async function sweepRequestLogs(logDir, retentionHours, now = Date.now()) {
+  if (!(retentionHours > 0)) return 0;
+  const cutoff = now - retentionHours * 3600_000;
+  let entries;
+  try {
+    entries = await readdir(logDir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const m = LOG_FILE_RE.exec(entry.name);
+    if (!m) continue;
+    const started = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]).getTime();
+    // Negated so anything not definitively older than the cutoff is skipped.
+    // The pattern admits only digits and Date rolls every such combination into
+    // a real time, so this cannot be indeterminate today; the shape keeps the
+    // bias toward skipping if the pattern is ever loosened.
+    if (!(started < cutoff)) continue;
+    const path = join(logDir, entry.name);
+    try {
+      const { mtimeMs } = await stat(path);
+      if (!(mtimeMs < cutoff)) continue;
+    } catch {
+      continue;
+    }
+    try {
+      await unlink(path);
+      removed++;
+    } catch { /* already gone, or a concurrent sweep won the race */ }
+  }
+  return removed;
+}
+
 // A per-request log that streams to disk as the request/response flow, instead
 // of buffering the whole body in memory and writing once at the end. The file
 // is opened on first write; header sections are written verbatim and bodies are
 // streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
 // so even a ~1M-token response costs only the current chunk.
-function openRequestLog(logDir, reqId) {
+function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL, maxBodyBytes = DEFAULT_LOG_MAX_BODY_BYTES } = {}) {
   const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
   const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
   ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
@@ -886,11 +1004,36 @@ function openRequestLog(logDir, reqId) {
     write,
     // Stream a complete body buffer under a section header.
     body(label, buf, contentType) {
+      if (level === 'headers') return;
       if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
-      new BodyWriter(write, label, contentType || '').chunk(buf);
+      if (maxBodyBytes > 0) {
+        // A complete body is already held whole, so keeping its tail costs no
+        // extra memory — and the tail is where the newest message and the latest
+        // tool result sit, which is usually what the log was opened for.
+        const half = Math.max(1, Math.floor(maxBodyBytes / 2));
+        const dropped = buf.length - 2 * half;
+        if (dropped > 0) {
+          // The tail goes in raw. Replaying it through the head's formatter would
+          // carry that formatter's depth and in-string state across the gap: the
+          // indentation would be wrong, and once the tail's closing brackets
+          // outnumber the depth it throws on a negative repeat count.
+          const head = new BodyWriter(write, label, contentType || '');
+          head.chunk(buf.subarray(0, half));
+          head.end();
+          write(`\n${truncationNote(dropped)}\n`);
+          write(buf.subarray(buf.length - half).toString('latin1'));
+          return;
+        }
+      }
+      const whole = new BodyWriter(write, label, contentType || '');
+      whole.chunk(buf);
+      whole.end();
     },
-    // A BodyWriter to append chunks incrementally (e.g. an SSE response).
-    bodyWriter(label, contentType) { return new BodyWriter(write, label, contentType || ''); },
+    // A BodyWriter to append chunks incrementally (e.g. an SSE response), or
+    // null when the level records no bodies — streamResponse takes either.
+    bodyWriter(label, contentType) {
+      return level === 'headers' ? null : new BodyWriter(write, label, contentType || '', maxBodyBytes);
+    },
     end() { if (!ended) { ended = true; ws.end('\n'); } },
   };
 }
@@ -976,6 +1119,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The 401 path reads ctx.reauthed on every response; default it here rather
   // than trusting every construction site to include it.
   ctx.reauthed ??= new Set();
+  // Same reason: a ctx built by an external caller carries no log settings.
+  ctx.logLevel ??= DEFAULT_LOG_LEVEL;
+  ctx.logMaxBodyBytes ??= DEFAULT_LOG_MAX_BODY_BYTES;
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
@@ -1134,7 +1280,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // request head+body are written once, just before the response is logged.
   let log = null;
   let reqLogged = false;
-  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const getLog = () => (logDir && ctx.logLevel !== 'off'
+    ? (log ||= openRequestLog(logDir, reqId, { level: ctx.logLevel, maxBodyBytes: ctx.logMaxBodyBytes }))
+    : null);
   const logRequestHead = () => {
     const l = getLog();
     if (!l || reqLogged) return;
@@ -1329,7 +1477,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     if (!upstreamRes.body) {
       const l = getLog();
-      if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
+      if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
       return;
     }
@@ -1342,7 +1490,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      try {
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      } finally {
+        // Also on the failure path: without the note a capped body reads as a
+        // stream that simply stopped, which is the other thing that happens here.
+        bw?.end();
+      }
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
