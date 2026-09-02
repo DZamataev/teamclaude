@@ -902,6 +902,74 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
+// Failures that say nothing about the ACCOUNT, only about the socket. Retrying
+// can succeed where failing over cannot, and closing fast lets Node evict the
+// dead socket so the client's retry reconnects cleanly. EPIPE joins the set as
+// the write-side sibling of ECONNRESET.
+//
+// ECONNREFUSED sits here despite being arguably a property of the host. It is
+// already unconditionally transient, so making it conditional converts every gap
+// in that condition into a regression instead of leaving an unfixed case. One
+// such gap was measurable before the other-host scan gated on selection's own
+// eligibility predicate: a disabled account carrying its own `upstream` was
+// never selected, never entered `ctx.tried`, and satisfied the condition
+// indefinitely — a four-account fleet spent three accounts on a refused
+// connection and answered rate_limit_error. That instance is closed; keeping
+// ECONNREFUSED unconditional means any future gap stays a non-regression.
+const SOCKET_TRANSIENT = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'TEAMCLAUDE_HEADERS_TIMEOUT', 'TEAMCLAUDE_BODY_TIMEOUT',
+]);
+
+// Failures that are a property of the HOST being dialled: name resolution and
+// routing. The hostname has no per-account component, so every account produces
+// the same failure, and walking the fleet spends an upstream call per account to
+// learn the same thing. The client is then told its quota is exhausted because a
+// name would not resolve.
+//
+// Conditional, because an account may name its own `upstream` for a third-party
+// backend. Where an untried account would dial a different host, this failure
+// says nothing about that one, and failing over is correct.
+const HOST_TRANSIENT = new Set(['ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN']);
+
+/**
+ * Every error code a failure carries: its own, its `cause`'s, and its
+ * children's. Node's global fetch puts the real error on `cause`, and the
+ * happy-eyeballs dialer reports an all-addresses-failed connect as an
+ * AggregateError that may carry no top-level code at all, with the reason
+ * recorded once per address.
+ */
+function errorCodes(err) {
+  const codes = [err?.code, err?.cause?.code];
+  for (const child of err?.errors || []) codes.push(child?.code);
+  for (const child of err?.cause?.errors || []) codes.push(child?.code);
+  return codes.filter(Boolean);
+}
+
+/**
+ * Should this upstream failure close the connection for the client to retry,
+ * instead of being failed over to the next account?
+ *
+ * `otherHostAvailable` states whether an untried account would dial a different
+ * host, which is what makes a host-scoped failure worth failing over. Exported
+ * for its own tests.
+ */
+export function isTransientUpstreamError(err, { otherHostAvailable = false } = {}) {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  const codes = errorCodes(err);
+  if (codes.some(c => SOCKET_TRANSIENT.has(c))) return true;
+  if (codes.some(c => HOST_TRANSIENT.has(c))) return !otherHostAvailable;
+  // Read last, and only once no code has been found. Node's global fetch, which
+  // `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH` selects, reports every failure with this
+  // message and the real error on `.cause`; checking it earlier would answer for
+  // the whole transport before the codes above were consulted, so a host-scoped
+  // failure there would never reach its conditional arm.
+  if (typeof err.message === 'string' && err.message.includes('fetch failed')) return true;
+  return false;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -1290,13 +1358,39 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
-    const isTransient = err instanceof Error &&
-      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
-        err.name === 'TimeoutError' || err.name === 'AbortError' ||
-        err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+    // Would failing over dial anywhere else? Only an untried account pointing at
+    // a different `upstream` makes that true, and it is what decides whether a
+    // name-resolution failure is worth retrying elsewhere.
+    //
+    // "Anywhere else" means an account that could actually serve THIS request:
+    // selection gates on routes and the disabled flag, so a different-host
+    // account this request can never legally route to gives failover nothing to
+    // reach. The check reuses the manager's own eligibility predicate rather
+    // than restating route logic — and deliberately not getActiveAccount, which
+    // can arm the probe cooldown as a side effect. Hosts are compared by
+    // hostname, so a port or path difference does not masquerade as a second
+    // host.
+    //
+    // A pinned request never fails over at all: once the pinned account has
+    // been tried, selection returns null and the caller sends the informative
+    // pinned-unavailable 429. Counting a pin as "somewhere else to go" keeps a
+    // host failure on that path instead of a bare reset.
+    //
+    // The advisor model is deliberately NOT part of the eligibility check:
+    // when no account satisfies both models, getActiveAccount degrades to
+    // executor-only routing, so failover reaches every executor-eligible
+    // account. Gating on the advisor here would call a reachable healthy host
+    // "nowhere to go" and reset a request that selection would have served.
+    // The scan is deliberately blind to the probe fallback (a soft-exhausted
+    // other-host account it rejects could still be probed) — conservative, and
+    // self-healing: probes from other requests refresh the stale quota.
+    const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
+    const thisHost = hostOf(account.upstream || upstream);
+    const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
+      a.index !== account.index && !ctx.tried.has(a.index) &&
+      hostOf(a.upstream || upstream) !== thisHost &&
+      accountManager._isAvailable(a, ctx.model));
+    const isTransient = isTransientUpstreamError(err, { otherHostAvailable });
 
     // Transient network errors (including a stale-socket headers/body timeout):
     // close the connection and let the client retry. Failing over to another
