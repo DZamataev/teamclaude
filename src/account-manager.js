@@ -17,6 +17,10 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 
+// Fallback when a per-bucket threshold table names neither the bucket nor a
+// `default` — the same value the single-number form has always used.
+const DEFAULT_SWITCH_THRESHOLD = 0.98;
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
@@ -231,6 +235,39 @@ export class AccountManager {
     // reset hours ago. Past this it is dropped and the local buckets decide.
     this.statusStaleMs = statusStaleMs
       ?? (Number(process.env.TEAMCLAUDE_STATUS_STALE_MS) || 30 * 60_000);
+  }
+
+  /**
+   * The utilization at which a given quota bucket takes an account out of
+   * rotation. One number governed every bucket, which conflates two different
+   * risks: 98% of a 5-hour window that refills in two hours is a nuisance, while
+   * 98% of a weekly window with six days left means the account is spent for the
+   * rest of the week. An operator who wants to rotate off the weekly bucket
+   * earlier than the 5-hour one had no way to say so.
+   *
+   * `switchThreshold` therefore accepts either form:
+   *
+   *   "switchThreshold": 0.98
+   *   "switchThreshold": { "default": 0.98, "unified7d": 0.9 }
+   *
+   * Bucket keys are the quota field names (unified5h, unified7d, unified7dFable,
+   * unified7dSonnet, tokens, requests). Anything unlisted takes `default`, so a
+   * bare number behaves exactly as it always has.
+   */
+  thresholdFor(bucket) {
+    const t = this.switchThreshold;
+    if (typeof t === 'number') return t;
+    if (t && typeof t === 'object') {
+      const v = t[bucket] ?? t.default;
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+    }
+    return DEFAULT_SWITCH_THRESHOLD;
+  }
+
+  /** The single number that best represents the configured threshold, for the
+   * places that show one (status header, TUI settings row). */
+  get effectiveThreshold() {
+    return this.thresholdFor('default');
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -647,7 +684,7 @@ export class AccountManager {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return false;
-    return q[key] != null && q[key] >= this.switchThreshold;
+    return q[key] != null && q[key] >= this.thresholdFor(key);
   }
 
   /**
@@ -1081,7 +1118,7 @@ export class AccountManager {
     // per account per window and no more. A reading with headroom is left alone:
     // it gates nothing, so it cannot seal anything in.
     for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
-      if (q[key] == null || q[key] < this.switchThreshold) continue;
+      if (q[key] == null || q[key] < this.thresholdFor(key)) continue;
       const seenField = `${key}SeenAt`;
       // Unknown age (restored from an older state file, or set by a path that
       // predates the stamp): start the clock now rather than clearing at once,
@@ -1192,7 +1229,7 @@ export class AccountManager {
     this._clearExpiredQuotas(account);
 
     // Shared 5-hour bucket gates every request regardless of model.
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
+    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h')) return true;
 
     // Only the weekly bucket that GOVERNS this model is checked: Fable and Sonnet
     // meter their own weekly quota, so a spent Fable bucket must not bar an Opus
@@ -1200,17 +1237,17 @@ export class AccountManager {
     // (e.g. the plan doesn't expose it), fall back to the shared weekly so an
     // account over its overall cap is still treated as near-quota.
     const weeklyVal = this._governingWeekly(account, model);
-    if (weeklyVal != null && weeklyVal >= this.switchThreshold) return true;
+    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model))) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= this.thresholdFor('tokens')) return true;
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= this.thresholdFor('requests')) return true;
     }
 
     return false;
@@ -1521,7 +1558,7 @@ export class AccountManager {
     const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
-      const wasSpent = q[key] != null && q[key] >= this.switchThreshold;
+      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key);
       if (bucket && bucket.utilization != null) {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
@@ -1534,7 +1571,7 @@ export class AccountManager {
         continue;
       }
       // Worth a line: the account was refusing this family and is not any more.
-      if (wasSpent && !(q[key] != null && q[key] >= this.switchThreshold)) {
+      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key))) {
         console.log(`[TeamClaude] Account "${account.name}" ${label} weekly quota confirmed available by probe`);
       }
     }
@@ -1772,7 +1809,11 @@ export class AccountManager {
     const sessions = this.sessionTracker.stats();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
-      switchThreshold: this.switchThreshold,
+      switchThreshold: this.effectiveThreshold,
+      // The full table when one is configured, so status output can show the
+      // per-bucket values rather than only the representative number.
+      switchThresholds: typeof this.switchThreshold === 'object' && this.switchThreshold
+        ? { ...this.switchThreshold } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({
