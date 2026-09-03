@@ -38,7 +38,17 @@ The **Quota probe** row on the TUI settings screen (`g`) does the same thing, an
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. API-key and third-party accounts are skipped. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 
-The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on.
+The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
+
+### Revalidating a spent family bucket
+
+Those `7d_oi` headers ride on **Fable responses only** — no other model's response carries them. That makes a spent Fable (or Sonnet) reading self-sealing: once it reads at or above the switch threshold, rotation stops sending that family to the account, which is also the only thing that could have refreshed the reading ([#167](https://github.com/KarpelesLab/teamclaude/issues/167)).
+
+So a spent family reading is trusted for 30 minutes. After that it is dropped, the family falls back to the shared weekly bucket, and the next request of that family re-establishes the truth from real headers — a rejection re-arms the gate with a fresh reading for another 30 minutes, so a genuinely spent bucket costs at most one rejected request per account per window. Set `TEAMCLAUDE_FAMILY_STALE_MS` to tune the window. Readings with headroom are never dropped: they gate nothing.
+
+Running the probe sidesteps this entirely — it refreshes the family buckets from the usage endpoint without spending quota, so a reset is picked up within one probe interval instead of within the staleness window.
+
+A probe revalidates a family bucket in full, which includes concluding that there is no cap. When the payload enumerates an account's scoped weekly caps and a family is **not** among them, the cached reading is cleared and that family falls back to the shared weekly bucket — upstream retiring a cap must not leave the proxy gating on it. A payload that carries no such enumeration proves nothing, so nothing changes. Each reported bucket also carries its own reset, taken verbatim: an unstarted window has no reset, and the bar shows no date rather than the shared weekly one.
 
 ## Keep-warm
 
@@ -59,6 +69,22 @@ Reset mode stores the target wall time and IANA timezone in the config, then sub
 Rolling mode uses the requested local time to save the next reset whose warm-up time has not passed, then schedules warm-ups on the same absolute five-hour cadence indefinitely. The saved anchor keeps the phase stable across service restarts and config reloads. Missed slots are skipped with no catch-up request; TeamClaude waits for the next point on the original cadence. If Anthropic reports that an account's current window resets within two minutes of a rolling slot, TeamClaude waits until ten seconds after that reset and retries only that account. It rechecks the account first, so normal usage that already started a new window suppresses the delayed warm-up. The retry is also skipped if its timer or token refresh runs beyond the following minute. This short per-account delay handles clock and reset-reporting imprecision without moving the global cadence or replaying a missed slot after restart. Because 24 hours is not divisible by 5, only the anchor reset occurs at the requested wall time: later reset times move around the local clock, and daylight-saving changes can shift their displayed local time as well. The CLI prints each rolling instant with its own UTC offset and ISO timestamp so repeated DST wall times remain unambiguous. This is best effort: an account with a live five-hour window outside the tolerance or an ineligible state is skipped at that slot.
 
 Keep-warm has nothing to do with the prompt cache — see [Prompt caching across rotation](routing.md#prompt-caching-across-rotation).
+
+## Switch threshold
+
+`switchThreshold` is the utilization at which an account is taken out of rotation. A single number governs every bucket:
+
+```json
+"switchThreshold": 0.98
+```
+
+That conflates two different risks, though: 98% of a 5-hour window that refills in two hours is a nuisance, while 98% of a weekly window with six days left means the account is spent for the rest of the week. To rotate off one bucket earlier than another, give a table instead:
+
+```json
+"switchThreshold": { "default": 0.98, "unified7d": 0.9 }
+```
+
+Keys are the quota field names — `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`, `tokens`, `requests`. Anything unlisted takes `default`, and a bare number behaves exactly as before. The TUI's ±1% control edits the single-number form; when a table is configured the settings row shows it read-only, so the ± control can't silently flatten your per-bucket values.
 
 ## Hold on exhaustion
 

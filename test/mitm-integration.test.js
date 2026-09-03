@@ -322,18 +322,28 @@ test('tunnel: upstream connect failure returns 502, not a silent drop', T, async
   }
 });
 
-test('MITM h2: a cancelled request stops before spending another account', T, async () => {
+// A client that has gone away must not keep spending quota. The retry ladder
+// asks `res.destroyed` at every rung, and `Http2ServerResponse` has no such
+// property, so on the MITM path, which is the busy one, each rung reads
+// `undefined` and the ladder runs to the end: an abandoned request is retried
+// on every remaining account, and each retry is a real upstream call against
+// that account's weekly quota.
+//
+// The measurement is the number of accounts spent, not the number of guards
+// passed. Anything that stops the ladder early satisfies this.
+test('MITM h2: a cancelled request stops the retry ladder instead of spending every account', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const hits = [];
-  let markFirstAttemptArrived;
-  const firstAttemptArrived = new Promise(resolve => { markFirstAttemptArrived = resolve; });
+  let cancelled = null;
+  const seenFirstHit = new Promise(r => { cancelled = r; });
+
+  // Every account is answered with a quota rejection, the branch that marks the
+  // account and moves to the next one. The first hit waits for the client to go
+  // away before answering, so the cancel lands before rung two is decided.
   const upstream = http.createServer(async (req, res) => {
-    for await (const chunk of req) void chunk;
-    hits.push(req.headers.authorization || 'none');
-    if (hits.length === 1) {
-      markFirstAttemptArrived();
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
+    for await (const c of req) void c;
+    hits.push(req.headers['authorization'] || 'none');
+    if (hits.length === 1) { cancelled(); await new Promise(r => setTimeout(r, 250)); }
     res.writeHead(429, {
       'content-type': 'application/json',
       'retry-after': '1',
@@ -342,186 +352,164 @@ test('MITM h2: a cancelled request stops before spending another account', T, as
     res.end('{}');
   });
   const upPort = await listen(upstream);
-  let markRequestEnded;
-  const requestEnded = new Promise(resolve => { markRequestEnded = resolve; });
+
   const am = new AccountManager(
-    ['a', 'b', 'c', 'd'].map((name, index) => oauthAccount(name, `t-${name}`, {
-      accountUuid: `${ACCOUNT_UUID.slice(0, -1)}${index}`,
-    })),
+    ['a', 'b', 'c', 'd'].map((n, i) => oauthAccount(n, `t-${n}`, { accountUuid: `${ACCOUNT_UUID.slice(0, -1)}${i}` })),
     0.98,
   );
-  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem }, {
-    hooks: { onRequestEnd: markRequestEnded },
-  });
+  const proxy = makeProxy(am, upPort, { leafCertPem, leafKeyPem });
   const proxyPort = await listen(proxy);
 
+  const realLog = console.log; const realErr = console.error;
+  console.log = () => {}; console.error = () => {};
   let client;
   try {
     const sock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
     client = http2.connect(`https://localhost:${upPort}`, { createConnection: () => sock });
-    const stream = client.request({
-      ':method': 'POST',
-      ':path': '/v1/messages',
-      'content-type': 'application/json',
-    });
-    stream.on('error', () => {});
+    const stream = client.request({ ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json' });
+    stream.on('error', () => { /* the cancel below is the point */ });
     stream.end(JSON.stringify({ model: 'claude-opus-5', messages: [] }));
 
-    await firstAttemptArrived;
-    stream.close(http2.constants.NGHTTP2_CANCEL);
+    await seenFirstHit;                              // the upstream has attempt one
+    stream.close(http2.constants.NGHTTP2_CANCEL);    // the client goes away
 
-    let timeout;
-    await Promise.race([
-      requestEnded,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('proxy request handler did not return')), 15_000);
-      }),
-    ]).finally(() => clearTimeout(timeout));
+    // Wait for the ladder to go quiet rather than for a fixed span. A fixed
+    // sleep passes for the wrong reason if the loop stalls: the servers close
+    // and the count is read before the remaining rungs ever run.
+    const settleMs = 400;
+    const capMs = 15000;
+    const startedAt = Date.now();
+    let lastCount = -1;
+    let lastChange = Date.now();
+    while (Date.now() - startedAt < capMs) {
+      if (hits.length !== lastCount) { lastCount = hits.length; lastChange = Date.now(); }
+      else if (Date.now() - lastChange >= settleMs) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
   } finally {
-    try { client?.destroy(); } catch { /* already closed */ }
-    closeHard(proxy);
-    closeHard(upstream);
+    console.log = realLog; console.error = realErr;
+    try { client?.destroy(); } catch { /* already gone */ }
+    closeHard(proxy); closeHard(upstream);
   }
 
-  assert.ok(hits.length >= 1, 'the request never reached upstream');
+  assert.ok(hits.length >= 1, 'the request never reached the upstream, so this proves nothing');
   assert.equal(hits.length, 1,
-    `the cancelled request spent ${hits.length} of ${am.accounts.length} accounts`);
+    `a cancelled h2 request spent ${hits.length} of ${am.accounts.length} accounts; `
+    + 'every rung past the first is quota burned for a client that is gone');
 });
 
+// Paths for the child below, which runs the proxy out of process.
 const X509_PATH = fileURLToPath(new URL('../src/x509.js', import.meta.url));
 const MITM_PATH = fileURLToPath(new URL('../src/mitm.js', import.meta.url));
-const ACCOUNT_MANAGER_PATH = fileURLToPath(new URL('../src/account-manager.js', import.meta.url));
+const AM_PATH = fileURLToPath(new URL('../src/account-manager.js', import.meta.url));
 
-function runCancelledSseScenario() {
+// A cancelled h2 stream must not strand the request handler.
+//
+// `res.write` to a cancelled stream returns false, which sends streamResponse
+// into its backpressure wait. That wait listens for `drain` or `close`, and on a
+// stream that is already closed neither will ever arrive: `close` fired before
+// the listener existed and `drain` does not fire on a closed stream. The read
+// that would have broken out first is the one this change is about.
+//
+// A stranded handler holds the event loop, so this runs in a child. In process
+// it would leave the runner unable to exit whether it passed or failed, and a
+// test that cannot fail cleanly is not a test.
+function h2SseCancelInChild() {
   const source = `
     import http from 'node:http';
     import http2 from 'node:http2';
     import { generateCertChain } from ${JSON.stringify(X509_PATH)};
     import { createConnectHandler } from ${JSON.stringify(MITM_PATH)};
-    import { AccountManager } from ${JSON.stringify(ACCOUNT_MANAGER_PATH)};
+    import { AccountManager } from ${JSON.stringify(AM_PATH)};
 
-    console.log = () => {};
-    console.error = () => {};
-    const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+    console.log = () => {}; console.error = () => {};
+    const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
     const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+    // Keeps feeding the proxy, so it keeps writing to a client that has left.
     let stop = false;
     const upstream = http.createServer(async (req, res) => {
-      for await (const chunk of req) void chunk;
+      for await (const c of req) void c;
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-      for (let index = 0; !stop && index < 200; index += 1) {
-        res.write('data: {"n":' + index + '}\\n\\n');
-        await new Promise(resolve => setTimeout(resolve, 20));
+      for (let n = 0; !stop && n < 200; n++) {
+        res.write('data: {"n":' + n + '}\\n\\n');
+        await new Promise(r => setTimeout(r, 20));
       }
       res.end();
     });
-    const upstreamPort = await listen(upstream);
+    const upPort = await listen(upstream);
 
-    const started = [];
-    const ended = [];
-    const accountManager = new AccountManager([{
-      name: 'a',
-      type: 'oauth',
-      accessToken: 't-a',
-      refreshToken: 'r',
+    const started = [], ended = [];
+    const am = new AccountManager([{
+      name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r',
       expiresAt: Date.now() + 3600000,
     }], 0.98);
     const proxy = http.createServer();
     proxy.on('connect', createConnectHandler({
-      config: { upstream: 'http://127.0.0.1:' + upstreamPort },
-      accountManager,
+      config: { proxy: {}, upstream: 'http://127.0.0.1:' + upPort },
+      accountManager: am,
       ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
-      hooks: {
-        onRequestStart: id => started.push(id),
-        onRequestEnd: id => ended.push(id),
-      },
+      hooks: { onRequestStart: (id) => started.push(id), onRequestEnd: (id) => ended.push(id) },
     }));
     const proxyPort = await listen(proxy);
 
+    // CONNECT, then h2 over the tunnel.
     const net = await import('node:net');
     const tls = await import('node:tls');
     const raw = net.connect(proxyPort, '127.0.0.1');
-    await new Promise(resolve => raw.once('connect', resolve));
-    raw.write('CONNECT 127.0.0.1:' + upstreamPort + ' HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n');
-    await new Promise(resolve => raw.once('data', resolve));
-    const socket = tls.connect({
-      socket: raw,
-      ca: caCertPem,
-      servername: 'localhost',
-      ALPNProtocols: ['h2'],
-    });
-    await new Promise(resolve => socket.once('secureConnect', resolve));
+    await new Promise(r => raw.once('connect', r));
+    raw.write('CONNECT 127.0.0.1:' + upPort + ' HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n');
+    await new Promise(r => raw.once('data', r));
+    const sock = tls.connect({ socket: raw, ca: caCertPem, servername: 'localhost', ALPNProtocols: ['h2'] });
+    await new Promise(r => sock.once('secureConnect', r));
 
-    const client = http2.connect('https://localhost:' + upstreamPort, { createConnection: () => socket });
+    const client = http2.connect('https://localhost:' + upPort, { createConnection: () => sock });
     client.on('error', () => {});
-    const stream = client.request({
-      ':method': 'POST',
-      ':path': '/v1/messages',
-      'content-type': 'application/json',
-    });
+    const stream = client.request({ ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json' });
     stream.on('error', () => {});
     stream.end(JSON.stringify({ model: 'claude-opus-5', messages: [], stream: true }));
 
     let sawChunk = false;
-    await new Promise(resolve => {
-      stream.on('data', () => {
-        if (!sawChunk) {
-          sawChunk = true;
-          resolve();
-        }
-      });
+    await new Promise((resolve) => {
+      stream.on('data', () => { if (!sawChunk) { sawChunk = true; resolve(); } });
       setTimeout(resolve, 6000);
     });
     stream.close(http2.constants.NGHTTP2_CANCEL);
 
-    const returned = await new Promise(resolve => {
+    // The entry closing is the signal that the handler returned.
+    const returned = await new Promise((resolve) => {
       const deadline = setTimeout(() => resolve(false), 8000);
       const poll = setInterval(() => {
         if (started.length > 0 && ended.length >= started.length) {
-          clearTimeout(deadline);
-          clearInterval(poll);
-          resolve(true);
+          clearTimeout(deadline); clearInterval(poll); resolve(true);
         }
       }, 50);
     });
     stop = true;
-    const result = JSON.stringify({
-      sawChunk,
-      started: started.length,
-      ended: ended.length,
-      returned,
-    });
-    process.stdout.write(result, () => process.exit(0));
+    process.stdout.write(JSON.stringify({ sawChunk, started: started.length, ended: ended.length, returned }));
+    process.exit(0);
   `;
-
-  return new Promise(resolve => {
-    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const output = [];
-    const errors = [];
-    child.stdout.on('data', chunk => output.push(String(chunk)));
-    child.stderr.on('data', chunk => errors.push(String(chunk)));
-    const kill = setTimeout(() => child.kill('SIGKILL'), 25_000);
-    child.on('close', (code, signal) => {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = [];
+    child.stdout.on('data', d => out.push(String(d)));
+    child.stderr.on('data', () => {});
+    // The ceiling is the point: a stranded handler keeps the child alive, so the
+    // parent has to be the one that gives up.
+    const kill = setTimeout(() => child.kill('SIGKILL'), 25000);
+    child.on('close', () => {
       clearTimeout(kill);
-      try {
-        resolve(JSON.parse(output.join('')));
-      } catch {
-        resolve({
-          error: output.join('') || 'child produced no result',
-          stderr: errors.join(''),
-          code,
-          signal,
-        });
-      }
+      try { resolve(JSON.parse(out.join(''))); } catch { resolve({ error: out.join('') || 'child produced nothing' }); }
     });
   });
 }
 
-test('MITM h2: cancelling an SSE stream lets the request handler return', { ...T, timeout: 60_000 }, async () => {
-  const result = await runCancelledSseScenario();
-  assert.ok(result.sawChunk, `the stream delivered nothing before cancellation: ${JSON.stringify(result)}`);
-  assert.ok(result.started > 0, `no request activity started: ${JSON.stringify(result)}`);
-  assert.ok(result.returned,
-    `the cancelled stream stranded its request handler: ${JSON.stringify(result)}`);
+test('MITM h2: a cancelled stream does not strand the request handler', { ...T, timeout: 60000 }, async () => {
+  const got = await h2SseCancelInChild();
+  assert.ok(got.sawChunk, `the stream never delivered a chunk, so nothing was cancelled mid-flight: ${JSON.stringify(got)}`);
+  assert.ok(got.started > 0, `no activity entry was opened, so this proves nothing: ${JSON.stringify(got)}`);
+  assert.ok(got.returned,
+    'a cancelled h2 stream left the request handler waiting on a drain or close that cannot arrive; '
+    + `its activity entry never closed and the handler holds the event loop: ${JSON.stringify(got)}`);
 });
