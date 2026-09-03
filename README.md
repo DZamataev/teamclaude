@@ -82,7 +82,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
-| [Git deployment](docs/deployment.md) | Release worktrees, branch switching, systemd, rollback, and operations |
+| [Git deployment](docs/deployment.md) | Integrated Linux/macOS install, ref switching, rollback, logs, and safe uninstall |
 | [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, upstream proxy, per-account routing, sx.org residential egress |
 | [Compliance](docs/compliance.md) | Who the project is for, and terms of service notes for each provider |
 | [Contributing](CONTRIBUTING.md) | What is in scope, and what a pull request needs |

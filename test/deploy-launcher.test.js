@@ -55,6 +55,49 @@ test('bootstrap discovery rejects old Node and ignores a PATH node from another 
   assert.equal(bootstrap.npmPath, '/opt/homebrew/bin/npm');
 });
 
+test('bootstrap discovery finds npm beside NVM Node when non-interactive PATH omits NVM', () => {
+  const nodePath = '/root/.nvm/versions/node/v24.19.0/bin/node';
+  const npmPath = '/root/.nvm/versions/node/v24.19.0/bin/npm';
+  const bootstrap = discoverBootstrap({
+    execPath: nodePath,
+    nodeVersion: '24.19.0',
+    pathEnv: '/usr/local/bin:/usr/bin:/bin',
+    findExecutable: command => command === 'node' ? '/usr/bin/node' : null,
+    realpath: value => value === '/usr/bin/node' ? '/usr/bin/node-v18' : value,
+    isExecutable: value => value === nodePath || value === npmPath,
+    installKind: 'git',
+    packageVersion: '1.1.13',
+    invokedCommandPath: '/usr/local/bin/teamclaude',
+  });
+  assert.equal(bootstrap.nodePath, nodePath);
+  assert.equal(bootstrap.npmPath, npmPath);
+});
+
+test('bootstrap discovery classifies global npm with the selected Node when PATH omits NVM', () => {
+  const nodePath = '/root/.nvm/versions/node/v24.19.0/bin/node';
+  const npmPath = '/root/.nvm/versions/node/v24.19.0/bin/npm';
+  const bootstrap = discoverBootstrap({
+    execPath: nodePath,
+    nodeVersion: '24.19.0',
+    pathEnv: '/usr/local/bin:/usr/bin:/bin',
+    findExecutable: () => null,
+    realpath: value => value,
+    isExecutable: value => value === nodePath || value === npmPath,
+    classifyInstall: ({ globalRoot }) => globalRoot === '/root/.nvm/versions/node/v24.19.0/lib/node_modules'
+      ? 'global'
+      : 'local',
+    run: (command, argv) => command === nodePath
+      && argv.join(' ') === `${npmPath} root --global`
+      ? result(0, '/root/.nvm/versions/node/v24.19.0/lib/node_modules\n')
+      : result(127, '', 'not found'),
+    packageVersion: '1.1.13',
+    invokedCommandPath: npmPath,
+  });
+
+  assert.equal(bootstrap.installKind, 'global');
+  assert.equal(bootstrap.packageVersion, '1.1.13');
+});
+
 test('launcher selection is fixed on Linux and stable on macOS', () => {
   const linux = { platform: 'linux', defaultLauncher: '/usr/local/bin/teamclaude' };
   assert.deepEqual(chooseLauncherPath({ layout: linux }), {
@@ -121,7 +164,7 @@ test('global npm handoff smoke-tests, uninstalls, publishes atomically, and veri
     ['write', `${launcherPath}.next-42-fixed`],
     ['chmod', `${launcherPath}.next-42-fixed`, 0o755],
     ['run', `${launcherPath}.next-42-fixed`, 'version'],
-    ['run', '/absolute/npm', 'uninstall', '-g', packageName],
+    ['run', '/absolute/node', '/absolute/npm', 'uninstall', '-g', packageName],
     ['rename', `${launcherPath}.next-42-fixed`, launcherPath],
     ['run', launcherPath, 'version'],
   ]);
@@ -163,7 +206,7 @@ test('npm cleanup failure still publishes the launcher with actionable partial s
   const outcome = await handoffLauncher({
     bootstrap: { nodePath: '/node', npmPath: '/npm', installKind: 'global', packageVersion: '1.1.13' },
     launcherPath, entryPath: '/deploy/current/src/index.js',
-    run: (command, argv) => argv[0] === 'uninstall' ? result(1, '', 'permission denied') : result(),
+    run: (command, argv) => argv[1] === 'uninstall' ? result(1, '', 'permission denied') : result(),
   });
   assert.equal(outcome.npmCleanupPending, true);
   assert.match(outcome.warning, /npm uninstall -g @karpeleslab\/teamclaude/);
@@ -191,7 +234,7 @@ test('npm restoration resolves exact command path, installs requested version, a
   const calls = [];
   const run = (command, argv, options = {}) => {
     calls.push({ command, argv, options });
-    if (argv[0] === 'prefix') return result(0, '/opt/npm-global\n');
+    if (argv[1] === 'prefix') return result(0, '/opt/npm-global\n');
     return result();
   };
   const resolved = await resolveNpmRestore({
@@ -199,13 +242,26 @@ test('npm restoration resolves exact command path, installs requested version, a
     nodePath: '/absolute/node', run, exists: async path => path === '/absolute/npm',
   });
   assert.deepEqual(resolved, {
-    packageSpec: '@karpeleslab/teamclaude@1.1.13', npmPath: '/absolute/npm',
+    packageSpec: '@karpeleslab/teamclaude@1.1.13', nodePath: '/absolute/node', npmPath: '/absolute/npm',
     commandPath: '/opt/npm-global/bin/teamclaude',
   });
   await restoreGlobalNpm(resolved, { run });
-  assert.deepEqual(calls.slice(1), [
-    { command: '/absolute/npm', argv: ['install', '--global', '@karpeleslab/teamclaude@1.1.13'], options: { stdio: 'inherit' } },
-    { command: '/opt/npm-global/bin/teamclaude', argv: ['version'], options: {} },
+  assert.deepEqual(calls, [
+    {
+      command: '/absolute/node',
+      argv: ['/absolute/npm', 'prefix', '--global'],
+      options: {},
+    },
+    {
+      command: '/absolute/node',
+      argv: ['/absolute/npm', 'install', '--global', '@karpeleslab/teamclaude@1.1.13'],
+      options: { stdio: 'inherit' },
+    },
+    {
+      command: '/absolute/node',
+      argv: ['/opt/npm-global/bin/teamclaude', 'version'],
+      options: {},
+    },
   ]);
 });
 
@@ -214,9 +270,10 @@ test('npm restoration uses latest only for a null recorded version and falls bac
     npmRestore: { packageName, version: null, npmPath: '/missing/npm' },
     nodePath: '/opt/homebrew/bin/node',
     exists: async path => path === '/opt/homebrew/bin/npm',
-    run: (command, argv) => argv[0] === 'prefix' ? result(0, '/prefix') : result(),
+    run: (command, argv) => argv[1] === 'prefix' ? result(0, '/prefix') : result(),
   });
   assert.equal(resolved.packageSpec, '@karpeleslab/teamclaude@latest');
+  assert.equal(resolved.nodePath, '/opt/homebrew/bin/node');
   assert.equal(resolved.npmPath, '/opt/homebrew/bin/npm');
   assert.equal(resolved.commandPath, '/prefix/bin/teamclaude');
 });
@@ -227,7 +284,8 @@ test('failed npm restore does not touch the active Git launcher', async (t) => {
   const launcher = join(root, 'teamclaude');
   await writeFile(launcher, '# TeamClaude-Owner: teamclaude-git-deploy-v1\n');
   await assert.rejects(restoreGlobalNpm({
-    packageSpec: '@karpeleslab/teamclaude@1.1.13', npmPath: '/npm', commandPath: '/prefix/bin/teamclaude',
+    packageSpec: '@karpeleslab/teamclaude@1.1.13', nodePath: '/node', npmPath: '/npm',
+    commandPath: '/prefix/bin/teamclaude',
   }, { run: () => result(1, '', 'registry unavailable') }), /registry unavailable/);
   assert.match(await readFile(launcher, 'utf8'), /TeamClaude-Owner/);
 });
