@@ -122,6 +122,24 @@ test('the status call carries the proxy API key and returns the payload', async 
   );
 });
 
+test('an external abort cancels an active status call before its timeout', async () => {
+  const controller = new AbortController();
+  let requestSignal = null;
+  const control = new RemoteControl({
+    port: 3456,
+    timeoutMs: 1000,
+    fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+      requestSignal = signal;
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }),
+  });
+  const status = control.status({ signal: controller.signal });
+  controller.abort(new Error('stop dashboard'));
+
+  await assert.rejects(status, /stop dashboard/);
+  assert.equal(requestSignal?.aborted, true);
+});
+
 test('a non-2xx status reply is an error, not a half-empty dashboard', async (t) => {
   const { control } = await makeSession(t, {
     routes: { 'GET /teamclaude/status': (req, res) => { res.writeHead(500); res.end('boom'); } },
