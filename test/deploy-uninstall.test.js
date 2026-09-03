@@ -26,7 +26,7 @@ function uninstallFixture({ version = '1.1.13', restoreOnUninstall = true, wasRu
   };
   const resolved = {
     packageSpec: `${packageName}@${version ?? 'latest'}`,
-    npmPath: '/absolute/npm', commandPath: '/npm-prefix/bin/teamclaude',
+    nodePath: '/absolute/node', npmPath: '/absolute/npm', commandPath: '/npm-prefix/bin/teamclaude',
   };
   const dependencies = {
     layout,
@@ -112,6 +112,22 @@ test('uninstall does not restore a legacy Git service rooted in the removed depl
   assert.equal(fx.calls.includes('restorePriorService'), false);
   assert.equal(fx.calls.includes('verifyPriorService'), false);
   assert.equal(result.restoredService, false);
+});
+
+test('restored npm command verification uses the selected Node when PATH has no node', async () => {
+  const fx = uninstallFixture();
+  delete fx.dependencies.verifyRestoredCommand;
+  fx.dependencies.run = (command, argv) => {
+    if (command === fx.resolved.commandPath) return { code: 127, stderr: '/usr/bin/env: node: not found' };
+    if (command === fx.resolved.nodePath && argv[0] === fx.resolved.commandPath && argv[1] === 'version') {
+      return { code: 0, stdout: '1.1.13\n', stderr: '' };
+    }
+    return { code: 0, stdout: '', stderr: '' };
+  };
+
+  const result = await createDeployManager(fx.dependencies).uninstall({ restoreNpm: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.partial, false);
 });
 
 test('no-restore uninstall removes only deployment-owned resources', async () => {

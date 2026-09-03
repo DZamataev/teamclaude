@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   serviceKind, launchAgentPath, systemdUnitPath, logPath, resolveExec, servicePath,
   renderLaunchAgent, renderSystemdUnit, installService, uninstallService, serviceStatus, LABEL,
@@ -207,6 +207,37 @@ test('uninstall unloads before deleting the unit file', async () => {
     await assert.rejects(readFile(launchAgentPath(home), 'utf8'));
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('simple service install and uninstall preserve deployment-owned definitions', async (t) => {
+  for (const kind of ['launchd', 'systemd']) {
+    const home = await mkdtemp(join(tmpdir(), `tc-owned-${kind}-`));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    const file = kind === 'launchd' ? launchAgentPath(home) : systemdUnitPath(home, null);
+    const definition = kind === 'launchd'
+      ? '<key>TeamClaudeOwner</key>\n<string>teamclaude-git-deploy-v1</string>\n'
+      : '# TeamClaude-Owner: teamclaude-git-deploy-v1\n[Service]\n';
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, definition);
+    const rec = recorder();
+    const common = { kind, home, run: rec.run, log: () => {}, xdgConfig: null };
+
+    for (const result of [
+      await installService({
+        ...common, platform: kind === 'launchd' ? 'darwin' : 'linux',
+        exec: { node: '/node', entry: '/teamclaude' },
+      }),
+      await uninstallService(common),
+    ]) {
+      assert.deepEqual(result, {
+        ok: false,
+        error: 'This service is managed by teamclaude deploy. Use: teamclaude deploy status',
+        deploymentOwned: true,
+      });
+    }
+    assert.equal(await readFile(file, 'utf8'), definition);
+    assert.deepEqual(rec.calls, []);
   }
 });
 

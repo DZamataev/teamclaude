@@ -1,184 +1,242 @@
 # Git deployment
 
-This page describes the release-based Linux deployment used for running a
-TeamClaude Git fork behind systemd. It supports switching between remote
-branches, tags, and commits while keeping the last healthy release available
-for rollback.
+TeamClaude can replace a regular global npm installation with a persistent Git
+deployment. Each deployed branch, tag, or commit becomes an immutable release;
+the service and the `teamclaude` terminal command both run the selected release.
 
-This is different from the global npm installation described in the quick
-start. The deployment helper is currently installed by the server operator; it
-is **not** included in the `@karpeleslab/teamclaude` npm package.
+The deployment command is part of the normal TeamClaude binary. There is no
+separate `teamclaude-deploy` package or second npm executable.
 
-## What is installed
+## Quick start
 
-The deployment uses these paths:
+Install TeamClaude and create a usable account configuration first:
+
+```bash
+npm install -g @karpeleslab/teamclaude
+teamclaude login                 # or: teamclaude import
+teamclaude deploy install https://github.com/OWNER/teamclaude.git --ref master
+```
+
+`deploy install` checks the existing config, Git, Node.js, the remote URL, and
+the requested ref before writing the deployment. It then clones or adopts the
+repository, creates a detached candidate release, runs the complete test suite,
+installs a boot-persistent service, checks service and application health, and
+finally hands the `teamclaude` command to the Git deployment.
+
+The global npm package is removed only after the Git launcher passes a smoke
+test. TeamClaude records the exact npm version and executable so uninstall can
+restore them later. If npm cleanup fails, the healthy Git deployment remains
+active and the command reports this recovery step:
+
+```bash
+npm uninstall -g @karpeleslab/teamclaude
+```
+
+## Daily operations
+
+```bash
+teamclaude deploy status
+teamclaude deploy ref feature/name
+teamclaude deploy restart
+teamclaude deploy logs
+teamclaude deploy logs --lines 250 --no-follow
+teamclaude deploy rollback
+teamclaude deploy uninstall
+```
+
+`teamclaude deploy status --json` emits only JSON and is suitable for scripts.
+`teamclaude status` is a different command: it queries the running proxy and its
+accounts, while `teamclaude deploy status` describes Git releases, the service,
+launcher, Node executable, and deployment metadata.
+
+`deploy logs` follows logs by default. Use `--no-follow` for finite output.
+`deploy rollback` swaps `current` and `previous`, so running it twice toggles
+back to the original release.
+
+## Selecting a ref
+
+Deploy a remote branch, tag, or commit:
+
+```bash
+teamclaude deploy ref master
+teamclaude deploy ref v1.2.0
+teamclaude deploy ref 0123456789abcdef
+```
+
+The resolver checks a remote branch first, then a tag, then an explicit commit.
+A local development branch must be pushed to the deployment repository before
+the server can resolve it.
+
+Every candidate is fetched into the persistent repository and checked out as a
+detached worktree. TeamClaude runs its full Node test suite before changing
+`current`. After the atomic switch it restarts the service and verifies both the
+service manager and `current/src/index.js status`. A failed test never activates
+the candidate. A failed restart or health check restores the exact previous
+`current`/`previous` pair, restarts it, and verifies the restored application.
+
+The candidate worktree is retained when deployment fails, making it available
+for diagnosis.
+
+## Linux layout and startup
+
+Linux deployment is system-wide and must be installed or mutated as root. It
+uses:
 
 ```text
 /opt/teamclaude/
-├── repo/                    # persistent clone of the Git fork
-├── releases/                # detached worktrees, one per deployment
-├── current -> releases/...  # active, last successfully deployed release
-└── previous -> releases/... # release that was active before current
+├── repo/                    # persistent Git repository
+├── releases/                # detached immutable worktrees
+├── current -> releases/...  # active release
+├── previous -> releases/... # prior release
+├── backups/                 # validated displaced service definition
+└── deployment.json          # private deployment metadata
 
 /etc/systemd/system/teamclaude.service
 /usr/local/bin/teamclaude
-/usr/local/sbin/teamclaude-deploy
-/usr/local/libexec/teamclaude-node
 ```
 
-The `teamclaude` command is a small wrapper around the active
-`current/src/index.js`. The service and terminal command therefore use the same
-code. `teamclaude-node` points at the absolute Node.js executable selected when
-the deployment was installed.
+The systemd unit is enabled under `multi-user.target`, uses `Restart=always`,
+and starts the last selected `current` release after a reboot. It records an
+absolute Node executable rather than depending on systemd's minimal PATH, so an
+NVM installation is supported.
 
-The account configuration and runtime quota state stay outside Git:
-
-```text
-/root/.config/teamclaude.json
-/root/.config/teamclaude.state.json
-```
-
-Deploying another ref does not replace either file.
-
-## Requirements
-
-- Linux with systemd
-- Git
-- Node.js 20 or newer
-- A remote Git repository reachable by the VPS
-- A valid TeamClaude config containing at least one account
-- Root access for updating the system service
-
-The reference deployment uses an NVM Node installation. The systemd unit keeps
-the matching NVM directory on `PATH`, so TeamClaude can also find programs such
-as `claude` when it launches them.
-
-## Everyday commands
-
-Show the active proxy status:
-
-```bash
-teamclaude status
-```
-
-Follow service logs:
-
-```bash
-journalctl -u teamclaude.service -f
-```
-
-Restart the active release without changing it:
-
-```bash
-systemctl restart teamclaude.service
-```
-
-Check service startup configuration:
+Useful checks are:
 
 ```bash
 systemctl is-enabled teamclaude.service
 systemctl is-active teamclaude.service
 systemctl show teamclaude.service -p ExecStart -p WorkingDirectory
+teamclaude deploy status
 ```
 
-An enabled system-level unit under `multi-user.target` starts the selected
-`current` release after a VPS reboot.
+## macOS layout and startup
 
-## Deploy a branch, tag, or commit
+macOS deployment is per-user and does not require root. It uses:
 
-Deploy the default branch:
+```text
+$HOME/Library/Application Support/TeamClaude/deploy/
+├── repo/
+├── releases/
+├── current -> releases/...
+├── previous -> releases/...
+├── backups/
+└── deployment.json
+
+$HOME/Library/LaunchAgents/com.karpeleslab.teamclaude.plist
+$HOME/Library/Logs/teamclaude.log
+```
+
+The LaunchAgent has `RunAtLoad` and `KeepAlive`, so the last selected release
+starts at login and restarts after an unexpected exit.
+
+The installer places the stable launcher in the first writable stable PATH
+directory among `/usr/local/bin`, `/opt/homebrew/bin`, and `$HOME/.local/bin`.
+It deliberately avoids version-specific NVM, asdf, Volta, and Homebrew Cellar
+directories. If none is available, the launcher is stored in the deployment's
+`bin` directory and the installer prints this exact zsh setup:
+
+```zsh
+path=("$HOME/Library/Application Support/TeamClaude/deploy/bin" $path)
+export PATH
+```
+
+## Configuration and data preservation
+
+The account config and runtime state remain outside the removable deployment
+root. The normal defaults are:
+
+```text
+Linux: $HOME/.config/teamclaude.json
+       $HOME/.config/teamclaude.state.json
+
+macOS: $HOME/.config/teamclaude.json
+       $HOME/.config/teamclaude.state.json
+```
+
+`TEAMCLAUDE_CONFIG` and `XDG_CONFIG_HOME` continue to select custom locations.
+Installation is refused if the config is inside the deployment root, because
+that root can be removed by uninstall.
+
+Deploy, rollback, and uninstall never purge the TeamClaude config or state.
+They also do not create, edit, reload, or remove nginx configuration. Retained
+service logs outside the deployment root are preserved. Version 1 intentionally
+has no config-purge option.
+
+## Uninstall
+
+Interactive and scripted forms are:
 
 ```bash
-teamclaude-deploy master
+teamclaude deploy uninstall
+teamclaude deploy uninstall --yes
+teamclaude deploy uninstall --yes --restore-npm
+teamclaude deploy uninstall --yes --no-restore-npm
 ```
 
-Deploy another remote branch:
+Without flags, TeamClaude asks:
+
+```text
+Remove the Git deployment, service, releases, and launcher? [y/N]
+Restore @karpeleslab/teamclaude as a global npm package? [Y/n]
+```
+
+`--yes` answers only the first question. `--restore-npm` and
+`--no-restore-npm` answer only the second. A non-interactive invocation must
+provide `--yes` and exactly one npm choice.
+
+When npm restoration is selected, TeamClaude resolves the predicted global
+command path, installs and verifies npm before stopping the healthy Git
+service, and only then removes deployment-owned resources. A deployment that
+started from a global npm package restores its exact recorded version. An
+adopted or source-based deployment, which has no trustworthy former version,
+restores `@karpeleslab/teamclaude@latest`; it never silently substitutes latest
+for a recorded exact version.
+
+The displaced service is restored only when its validated backup is npm-backed
+and outside the Git deployment root. A legacy service that refers to
+`/opt/teamclaude` is not restored because removing that root would make it
+invalid.
+
+Every destructive step checks owner markers, regular-file identity, safe
+release links, backup hashes, and the exact platform root. An unmarked operator
+launcher or service is preserved or causes a preflight refusal. If teardown
+fails before its commit boundary, TeamClaude restores the Git service and
+launcher, restarts the unchanged release, and checks its health. If root removal
+fails after npm and the prior service have been restored, uninstall reports
+partial success and lists the remaining path instead of undoing the healthy
+replacement.
+
+With `--no-restore-npm`, the global package and prior service are not restored.
+The `teamclaude` command is intentionally removed together with the Git
+deployment. Config, state, nginx, and retained logs are still preserved.
+
+## Migrating an existing VPS release layout
+
+An existing `/opt/teamclaude` repository, `releases`, `current`, `previous`, and
+system service can be adopted in place. First use the legacy operator helper to
+deploy a ref that already contains the integrated `teamclaude deploy` command.
+Then run from that active release:
 
 ```bash
-teamclaude-deploy my-feature
+teamclaude deploy install https://github.com/OWNER/teamclaude.git --ref <same-ref>
 ```
 
-Deploy a tag or commit:
+The installer verifies that the existing repository has the same origin and
+that every selection link resolves to a direct child of `releases`. It reruns
+the candidate tests, replaces the service and launcher with owner-marked
+definitions, and writes deployment metadata. It does not reclone the repository
+or remove a release. Config, nginx, `current`, `previous`, and releases are not
+migrated or rewritten merely to adopt the layout.
 
-```bash
-teamclaude-deploy v1.2.0
-teamclaude-deploy 0123456789abcdef
-```
-
-A local development branch must be pushed to the configured `origin` before
-the VPS can deploy it:
-
-```bash
-git push -u origin my-feature
-ssh root@your-vps teamclaude-deploy my-feature
-```
-
-The helper performs the following sequence:
-
-1. Fetches branches and tags from `origin`.
-2. Resolves the requested ref to an immutable commit.
-3. Creates a detached worktree below `/opt/teamclaude/releases`.
-4. Runs the complete Node test suite.
-5. Records the old `current` release as `previous`.
-6. Atomically switches `current` to the candidate.
-7. Restarts `teamclaude.service`.
-8. Checks both systemd state and `teamclaude status`.
-
-Fetch, ref-resolution, worktree, or test failures leave the running release
-untouched. A failed service health check switches `current` back to the former
-release and restarts it automatically. The command exits non-zero whenever the
-candidate was not activated.
-
-The restart creates a short interruption, normally a few seconds. A reverse
-proxy may remain online during that interval, but requests reaching TeamClaude
-can fail until the health check passes.
-
-## Inspect the active and previous releases
-
-```bash
-readlink -f /opt/teamclaude/current
-git -C /opt/teamclaude/current rev-parse HEAD
-
-readlink -f /opt/teamclaude/previous
-git -C /opt/teamclaude/previous rev-parse HEAD
-```
-
-Confirm Git provenance:
-
-```bash
-git -C /opt/teamclaude/current remote get-url origin
-git -C /opt/teamclaude/current log -1 --oneline
-```
-
-## Roll back
-
-The normal rollback is another tested deployment of a known-good ref:
-
-```bash
-teamclaude-deploy <known-good-branch-tag-or-commit>
-```
-
-If the Git remote is unavailable and an emergency rollback is required, point
-`current` at the already-tested `previous` worktree and restart the service:
-
-```bash
-previous="$(readlink -f /opt/teamclaude/previous)"
-test -n "$previous"
-test -f "$previous/src/index.js"
-ln -s "$previous" "/opt/teamclaude/current.next.$$"
-mv -Tf "/opt/teamclaude/current.next.$$" /opt/teamclaude/current
-systemctl restart teamclaude.service
-teamclaude status
-```
-
-Always verify status after a manual rollback. The deployment helper is preferred
-because it also runs tests, records the release transition, and performs health
-verification.
+Exercise `teamclaude deploy ref`, verify application health, and reboot the VPS
+before retiring the legacy helper. Back up `/usr/local/sbin/teamclaude-deploy`
+first; remove it only after the integrated commands and reboot startup have both
+been verified.
 
 ## Reverse proxy
 
-TeamClaude listens on the loopback address by default. A typical nginx upstream
-is:
+Reverse-proxy management is intentionally outside the deploy command. A typical
+nginx upstream remains:
 
 ```nginx
 location / {
@@ -186,37 +244,20 @@ location / {
 }
 ```
 
-Keep the TeamClaude listener on loopback when nginx is the only public entry
-point. If TeamClaude is bound to a non-loopback interface instead, configure
-`proxy.apiKey`; remote clients must not have unauthenticated access to a proxy
-that injects account credentials.
+Keep TeamClaude on loopback when nginx is the only public entry point. An HTTP
+`401 Unauthorized` from the public endpoint can be the expected nginx-auth
+response; use `teamclaude deploy status` and `teamclaude status` locally to
+distinguish proxy authentication from application health.
 
-An HTTP `401 Unauthorized` from the public nginx endpoint can be the expected
-result when nginx authentication is enabled. Check the local TeamClaude status
-separately to distinguish proxy authentication from an unhealthy application:
+## Troubleshooting
 
-```bash
-teamclaude status
-curl -fsS http://127.0.0.1:3456/teamclaude/status
-```
-
-## Logs and troubleshooting
-
-Show recent service failures:
+Inspect recent logs without following:
 
 ```bash
-systemctl status teamclaude.service --no-pager
-journalctl -u teamclaude.service -n 100 --no-pager
+teamclaude deploy logs --lines 100 --no-follow
 ```
 
-Validate the installed unit and deployment script:
-
-```bash
-systemd-analyze verify /etc/systemd/system/teamclaude.service
-bash -n /usr/local/sbin/teamclaude-deploy
-```
-
-If a ref cannot be resolved:
+Inspect available refs directly when resolution fails:
 
 ```bash
 git -C /opt/teamclaude/repo fetch --prune --tags origin
@@ -224,54 +265,17 @@ git -C /opt/teamclaude/repo branch -r
 git -C /opt/teamclaude/repo tag --list
 ```
 
-If a deployment stops at the test step, run the same suite in the candidate
-release shown in its output:
+If candidate tests fail, the error names the retained release directory. Run
+the same command there with the Node path reported by deploy status:
 
 ```bash
 cd /opt/teamclaude/releases/<candidate-release>
-/usr/local/libexec/teamclaude-node --test --test-timeout=120000
+<absolute-node> --test --test-timeout=120000
 ```
 
-If the terminal cannot find `teamclaude-deploy`, verify whether
-`/usr/local/sbin` is on `PATH`:
+## npm packaging
 
-```bash
-command -v teamclaude-deploy
-print -r -- $path  # zsh
-```
-
-For zsh, add it when necessary:
-
-```zsh
-path=(/usr/local/sbin $path)
-export PATH
-```
-
-The reference VPS uses Bash as root's login shell. Zsh must be installed and
-configured separately if it is preferred.
-
-## Backups and old releases
-
-The initial migration stores the former systemd and nginx files below:
-
-```text
-/root/teamclaude-migration-backup/<UTC timestamp>/
-```
-
-Do not delete `current` or `previous`. Older detached worktrees can be listed
-and removed explicitly:
-
-```bash
-git -C /opt/teamclaude/repo worktree list
-git -C /opt/teamclaude/repo worktree remove /opt/teamclaude/releases/<old-release>
-git -C /opt/teamclaude/repo worktree prune
-```
-
-Check both symlink targets before removing an old release.
-
-## npm packaging status
-
-The current npm package contains `src/` and exposes one binary:
+The npm package still exposes one binary:
 
 ```json
 {
@@ -281,11 +285,6 @@ The current npm package contains `src/` and exposes one binary:
 }
 ```
 
-Consequently, `npm install -g @karpeleslab/teamclaude` does not install
-`teamclaude-deploy`, the Git release layout, or the systemd unit. Adding that
-behavior upstream requires a separately designed cross-platform installer or
-additional npm binary. Until such a feature is released, treat
-`teamclaude-deploy` as operator-managed VPS tooling.
-
-Installing the global npm package is unnecessary for this layout. The service
-and `teamclaude` wrapper both run the source selected by `current`.
+All deployment modules ship below `src/deploy/`. There is no postinstall hook:
+installing the npm package alone does not create a service or mutate deployment
+state. The explicit `teamclaude deploy install` command performs the handoff.
