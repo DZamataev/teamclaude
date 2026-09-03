@@ -34,6 +34,7 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { resolveControlHost, runWatchDashboard } from './watch-dashboard.js';
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -77,6 +78,9 @@ switch (command) {
   case 'status':
     await statusCommand();
     process.exit(0);
+    break;
+  case 'watch':
+    process.exit(await runWatchDashboard());
     break;
   case 'attach':
     await attachCommand();
@@ -914,8 +918,7 @@ async function attachCommand() {
   // the config or the environment is not reachable as localhost, and reporting
   // "not running" for a server that is plainly up is the worst of the answers.
   // A wildcard bind is not an address to dial, so dial this machine instead.
-  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
-  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const host = resolveControlHost(config);
 
   // Checked before connecting: the dashboard needs raw-mode input, and failing
   // on that after a successful poll would be a confusing order to report it in.
@@ -1564,6 +1567,8 @@ Commands:
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  watch               Open the read-only terminal dashboard with TeamClaude
+                      quota and Anthropic service status; refreshes every minute
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   accounts            List configured accounts

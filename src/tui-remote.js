@@ -1,6 +1,7 @@
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
+import { timeoutSignal } from './abort.js';
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -27,8 +28,8 @@ export class RemoteControl {
   }
 
   /** The current status payload (the same one `teamclaude status` renders). */
-  async status() {
-    const payload = await this._call('GET', '/teamclaude/status');
+  async status({ signal = null } = {}) {
+    const payload = await this._call('GET', '/teamclaude/status', undefined, signal);
     // A status reply always carries an accounts array, even when it is empty.
     // Anything else answered on this port is not this control plane, and calling
     // that "connected with no accounts" would diagnose the wrong problem.
@@ -79,13 +80,15 @@ export class RemoteControl {
     return payload;
   }
 
-  async _call(method, path, body) {
+  async _call(method, path, body, signal = null) {
     const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const headers = {};
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     if (body !== undefined) headers['content-type'] = 'application/json';
 
     let res;
+    let text;
+    const request = timeoutSignal(signal, deadline);
     try {
       res = await this._fetch(`http://${this.host}:${this.port}${path}`, {
         method, headers,
@@ -93,15 +96,17 @@ export class RemoteControl {
         // A socket that is open but silent — the server stopped, the laptop
         // suspended mid-request — would otherwise hold this call for minutes
         // while the dashboard showed a live marker over a frozen snapshot.
-        signal: AbortSignal.timeout(deadline),
+        signal: request.signal,
       });
+      text = await res.text();
     } catch (err) {
       if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
         throw new Error(`no reply within ${deadline}ms`);
       }
       throw err;
+    } finally {
+      request.cleanup();
     }
-    const text = await res.text();
     let payload = null;
     try { payload = text ? JSON.parse(text) : null; } catch { /* not JSON — the status carries the meaning */ }
 

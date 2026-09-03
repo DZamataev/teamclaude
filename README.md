@@ -43,6 +43,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 ```bash
 teamclaude accounts          # accounts with tier and token status
 teamclaude status            # live proxy status, needs a running server
+teamclaude watch             # read-only terminal dashboard, refreshes every minute
 teamclaude disable <name>    # pause an account without removing it
 teamclaude priority <name> 1 # rotation order, lower = preferred
 teamclaude alias --install   # make plain `claude` go through the proxy
@@ -51,6 +52,17 @@ teamclaude help              # everything else
 
 Full reference: [docs/usage.md](docs/usage.md).
 
+## Terminal dashboard
+
+Run the read-only dashboard in a terminal connected to the TeamClaude host:
+
+```bash
+teamclaude watch
+```
+
+It shows the same account, routing, quota, probe, and keep-warm details as `teamclaude status`, together with a short summary from Anthropic's public service-status page. The dashboard fetches both views once a minute, builds the complete frame before repainting, and preserves the colored quota bars without clearing and flashing the terminal. The previous frame stays visible while each refresh is in progress; `Ctrl+C` exits and restores the cursor.
+
+Unlike `teamclaude attach`, `watch` is deliberately read-only and has no keyboard controls or activity stream. Use `attach` when you need the interactive dashboard and `watch` for a compact operational overview over SSH. No commands beyond the installed TeamClaude package are required.
 ## Configuration
 
 Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it, safe to delete since quota gets re-learned from traffic.
