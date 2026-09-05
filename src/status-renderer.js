@@ -1,4 +1,5 @@
 import { findFamilyBlock, modelGlobOverlaps } from './model.js';
+import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -307,10 +308,6 @@ function formatAccountProbe(accountName, probe, now, paint) {
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';
   const error = row.error ? `, ${safeLine(row.error)}` : '';
   return `${status}${when}${duration}${error}`;
-}
-
-function safeLine(value) {
-  return String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
 function formatUsage(usage = {}, now) {

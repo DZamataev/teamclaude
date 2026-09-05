@@ -13,6 +13,7 @@ import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { safeLine } from './safe-text.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -597,7 +598,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         try { token = decodeURIComponent(raw); } catch { token = null; }
         pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
-          const shown = token ?? raw;
+          // Client-supplied and already percent-decoded, so this is the one
+          // value on the path that can carry raw control bytes.
+          const shown = safeLine(token ?? raw);
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
@@ -619,7 +622,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           return;

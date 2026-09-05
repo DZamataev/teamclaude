@@ -29,6 +29,7 @@ import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -400,8 +401,11 @@ async function serverCommand() {
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
     const writeActivity = msg => {
-      // Strip [TeamClaude] prefix to match TUI behaviour
-      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+      // Strip [TeamClaude] prefix to match TUI behaviour. Sanitized because a
+      // log line is one line: a value carrying a newline would otherwise write
+      // a second entry that reads as genuine, and this file is what deployments
+      // join against to attribute traffic to a person.
+      aStream.write(`${ts()}  ${sanitizeText(msg.replace(/^\[TeamClaude\]\s*/, ''))}\n`);
     };
     // Capture request completions via the hook
     const inFlight = new Map();

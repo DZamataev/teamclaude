@@ -8,6 +8,7 @@ import {
 } from './identity.js';
 import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { sanitizeText } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -484,7 +485,9 @@ export class TUI {
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
+    // sanitizeText, not `strip`: the latter removes SGR colour only, so an
+    // erase or cursor-move sequence reached the file, as did a newline.
+    if (this._activityStream) this._activityStream.write(`${t}  ${sanitizeText(msg)}\n`);
     if (this.running) this.render();
   }
 
