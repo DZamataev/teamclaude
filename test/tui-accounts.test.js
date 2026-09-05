@@ -286,7 +286,12 @@ test('import stores quota tier metadata returned by the OAuth profile', async ()
 
   await tui._doImport();
 
-  assert.deepEqual(config.accounts[0], {
+  // The entry id is minted per entry and is not a tier field (#199), so it is
+  // checked for shape and set aside rather than pinned to a value the test
+  // cannot know. Everything else is compared exactly.
+  const { id, ...entry } = config.accounts[0];
+  assert.match(id, /^[0-9a-f-]{36}$/, 'a new entry is given an id');
+  assert.deepEqual(entry, {
     name: 'team@x.com', type: 'oauth', source: 'import',
     accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
     organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
