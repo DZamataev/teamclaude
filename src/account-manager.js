@@ -1,4 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { refreshCodexToken } from './codex-auth.js';
+import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -95,6 +98,13 @@ function makeAccount(acct, index) {
     id: acct.id || null,
     name: acct.name,
     type: acct.type,
+    // Which backend this account talks to. Absent means Anthropic, so configs
+    // written before providers existed keep working untouched.
+    provider: providerOf(acct),
+    // Codex scopes a token to one ChatGPT account via a request header; this is
+    // that id. The Anthropic counterpart is `accountUuid`, which is patched
+    // into the request body instead.
+    accountId: acct.accountId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -174,12 +184,13 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
+    this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
@@ -392,14 +403,36 @@ export class AccountManager {
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
-    const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId);
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER) {
+    const account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
     // Record where this route now sits, whatever path chose it — the steady-state
     // path returns the account the cursor already names and never reaches the
     // rotation code, so recording there alone would leave the cursor unset and
     // the next real failover unpaced.
     if (account) this.routeCursors.set(this._cursorKey(model), account.index);
     return account;
+  }
+
+  /**
+   * Widen a request's exclude set to every account that belongs to a different
+   * provider.
+   *
+   * A provider partition is absolute — an Anthropic account cannot serve an
+   * OpenAI Responses request at all — so it is expressed as exclusion rather
+   * than threaded through the rotation logic. Everything downstream already
+   * reads `exclude`, so cursors, pinning, session affinity, probing and
+   * preemption keep working unchanged, and a config with no Codex accounts
+   * produces the identical set it did before.
+   *
+   * Returns the caller's own set untouched when nothing needs excluding, so
+   * the common single-provider case allocates nothing.
+   */
+  _excludeOtherProviders(exclude, provider) {
+    const foreign = this.accounts.filter(a => providerOf(a) !== provider);
+    if (foreign.length === 0) return exclude;
+    const combined = new Set(exclude || []);
+    for (const account of foreign) combined.add(account.index);
+    return combined;
   }
 
   _pickActiveAccount(exclude, model, advisorModel, sessionId) {
@@ -1500,9 +1533,65 @@ export class AccountManager {
   /**
    * Update an account's quota tracking from upstream response headers.
    */
+  /**
+   * Apply a Codex response's rate-limit headers.
+   *
+   * Only fields the response actually stated are assigned: a reading that a
+   * given response did not carry must not blank what we already knew, and the
+   * catalog fetch carries none at all.
+   */
+  _updateCodexQuota(account, headers) {
+    const parsed = parseCodexQuota(headers);
+    const plan = parseCodexPlanType(headers);
+    if (plan) account.quota.planType = plan;
+
+    if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified7d != null) account.quota.unified7d = parsed.unified7d;
+    if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
+    if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
+
+    // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
+    // Fable bucket: it rides only on responses for that model, so stamp when
+    // the reading was taken. That timestamp is what lets a spent bucket be
+    // revalidated instead of sealing the account out of the family forever.
+    for (const bucket of parsed.modelBuckets || []) {
+      (account.quota.codexModelBuckets ??= {})[bucket.slug] = {
+        name: bucket.name,
+        utilization: bucket.utilization,
+        resetAt: bucket.resetAt,
+        seenAt: Date.now(),
+      };
+    }
+
+    // Same handshake as the Anthropic path: the first response that reveals a
+    // weekly limit ends probing and asks selection to re-evaluate.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+
+    if (this._isNearQuota(account)) {
+      const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
+      console.log(`[TeamClaude] "${account.name}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
+    }
+  }
+
   updateQuota(accountIndex, headers) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Codex reports the same information under its own header names, so it is
+    // normalised into the very fields the Anthropic path fills. Everything
+    // downstream — the switch threshold, reset countdowns, the TUI bars — then
+    // works unchanged rather than needing a parallel Codex-shaped path.
+    if (providerOf(account) === 'codex') {
+      this._updateCodexQuota(account, headers);
+      return;
+    }
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
@@ -1804,7 +1893,13 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await this._refreshFn(account.refreshToken);
+        // Each provider mints tokens at its own endpoint with its own client
+        // id, so the grant is dispatched by provider. Both return the same
+        // { accessToken, refreshToken, expiresAt } shape, which is what lets
+        // everything downstream stay provider-agnostic.
+        const newTokens = await (providerOf(account) === 'codex'
+          ? this._codexRefreshFn(account.refreshToken)
+          : this._refreshFn(account.refreshToken));
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
