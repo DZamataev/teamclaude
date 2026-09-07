@@ -125,7 +125,8 @@ export async function runWatchDashboard({
         now: frameNow,
       });
       const prefix = painted ? '\x1b[H' : '\x1b[?25l\x1b[2J\x1b[H';
-      stdout.write(`${prefix}${frame}\n\x1b[J`);
+      const repaint = `${frame.replaceAll('\n', '\x1b[K\n')}\x1b[K`;
+      stdout.write(`${prefix}${repaint}\n\x1b[J`);
       painted = true;
       const elapsed = Math.max(0, now() - cycleStartedAt);
       await wait(Math.max(0, REFRESH_MS - elapsed), signal);

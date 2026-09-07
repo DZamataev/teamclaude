@@ -10,6 +10,59 @@ import { resetUpstreamProxy, setUpstreamProxy } from '../src/upstream-proxy.js';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
+function emulateTerminal(output) {
+  const rows = [''];
+  let row = 0;
+  let column = 0;
+  const ensureRow = () => {
+    while (rows.length <= row) rows.push('');
+  };
+
+  for (let offset = 0; offset < output.length;) {
+    const control = output[offset] === '\x1b' && output[offset + 1] === '['
+      ? /^\x1b\[([?0-9;]*)([A-Za-z])/.exec(output.slice(offset))
+      : null;
+    if (control) {
+      const [sequence, parameters, command] = control;
+      if (command === 'H') {
+        row = 0;
+        column = 0;
+      } else if (command === 'J' && parameters === '2') {
+        rows.splice(0, rows.length, '');
+        row = 0;
+        column = 0;
+      } else if (command === 'J') {
+        ensureRow();
+        rows[row] = rows[row].slice(0, column);
+        rows.splice(row + 1);
+      } else if (command === 'K') {
+        ensureRow();
+        rows[row] = rows[row].slice(0, column);
+      }
+      offset += sequence.length;
+      continue;
+    }
+    if (output[offset] === '\n') {
+      row++;
+      column = 0;
+      ensureRow();
+      offset++;
+      continue;
+    }
+    if (output[offset] === '\r') {
+      column = 0;
+      offset++;
+      continue;
+    }
+    ensureRow();
+    const characters = [...rows[row]];
+    characters[column++] = output[offset++];
+    rows[row] = characters.join('');
+  }
+
+  return rows.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+}
+
 test('watch is a terminal command and explains when no terminal is attached', () => {
   const result = spawnSync(process.execPath, [cliPath, 'watch'], {
     encoding: 'utf8',
@@ -205,6 +258,43 @@ test('the dashboard repaints complete frames in place and restores the cursor', 
   assert.match(output, /Anthropic: OPERATIONAL/);
   assert.match(output, /Anthropic: MINOR — Elevated errors \(identified\)/);
   assert.ok(output.endsWith('\x1b[?25h\n'), 'cursor must be visible after exit');
+});
+
+test('a shorter quota reset fully replaces the previous terminal row', async () => {
+  const controller = new AbortController();
+  const writes = [];
+  const now = Date.parse('2026-09-07T20:59:30Z');
+  const common = {
+    currentAccount: 'a',
+    switchThreshold: 0.95,
+    probe: { enabled: false, intervalSeconds: 0, accounts: [] },
+  };
+  const account = resetAt => ({
+    name: 'a',
+    type: 'oauth',
+    status: 'active',
+    usage: {},
+    quota: { unified5h: 0, unified5hReset: resetAt },
+  });
+  const statuses = [
+    { ...common, accounts: [account(now + (4 * 60 + 29) * 60_000)] },
+    { ...common, accounts: [account(now + 33_000)] },
+  ];
+  let reads = 0;
+
+  await dashboard.runWatchDashboard({
+    stdout: { isTTY: true, write(chunk) { writes.push(String(chunk)); return true; } },
+    stderr: { write() { return true; } },
+    signal: controller.signal,
+    readTeamClaude: async () => statuses[reads++],
+    readAnthropic: async () => 'Anthropic: OPERATIONAL',
+    wait: async () => { if (reads === 2) controller.abort(); },
+    now: () => now,
+  });
+
+  const screen = emulateTerminal(writes.join(''));
+  const session = screen.split('\n').find(line => line.includes('Session'));
+  assert.match(session || '', /0% reset 33s$/);
 });
 
 test('the first frame replaces the screen only after both reads finish', async () => {
