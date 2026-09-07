@@ -1,5 +1,6 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { ensureAccountIds } from './account-id.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -41,15 +42,39 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
 
   for (const diskAcct of diskConfig.accounts) {
     const mgrIdx = claim(diskAcct);
+    // Claimed once per disk entry and reused below. Calling claimConfig twice
+    // for one entry would consume two different config rows.
+    const cfgAcct = claimConfig(diskAcct);
 
     if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
-      memConfig.accounts.push(diskAcct);
+      // No manager account — which is NOT the same as "not yet known".
+      // resolveAccounts drops every entry without a usable credential (an oauth
+      // entry with no token, or an importFrom whose file has gone away — what
+      // logging out of Claude Code produces), so such an entry has no account
+      // for the life of the process. Pushing a config row for it on every pass
+      // grew the list without bound: the save carried the duplicate to disk, the
+      // next reload found another unclaimable row, and the pair compounded
+      // (#200, #235).
+      //
+      // The account is still added, so an entry whose credential reappears heals
+      // on the next reload rather than needing a restart. Only the duplicate
+      // config row is suppressed.
+      if (!cfgAcct) {
+        // Genuinely new. Both lists take the same object, so the account is
+        // built carrying its entry's id and the two pair from the moment they
+        // exist. ensureAccountIds runs between the two: a hand-copied section
+        // arrives holding an id this list already uses, and re-minting it before
+        // the account is built keeps the pair correct.
+        memConfig.accounts.push(diskAcct);
+        ensureAccountIds(memConfig.accounts);
+        cfgClaimed.add(memConfig.accounts.length - 1);
+      }
       accountManager.addAccount(diskAcct);
       claimed.add(accountManager.accounts.length - 1);
-      cfgClaimed.add(memConfig.accounts.length - 1);
       added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      console.log(cfgAcct
+        ? `[TeamClaude] Re-admitting known account "${diskAcct.name}" from config`
+        : `[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
 
@@ -64,6 +89,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // A cap edit applies live for the same reason priority does: it is an
+    // operator decision about a running fleet, and waiting for a restart to
+    // honour a budget defeats the budget.
+    mgr.maxUsage = diskAcct.maxUsage ?? null;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -77,10 +106,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // disk edit on the next save — and the following reload would then revert
     // the running account too. Delete-on-absence keeps the saved JSON clean,
     // the same shape a hand edit produces.
-    const cfgAcct = claimConfig(diskAcct);
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
