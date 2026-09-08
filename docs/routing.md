@@ -138,6 +138,39 @@ More precisely, a session holds **one pin per weekly quota bucket**, not one ove
 
 **Families that share a bucket share a pin, including when only one of them is separately metered.** Upstream can report a *learned* weekly bucket scoped to a family the static table has no entry for; routing then meters that family on its own window (see [Expiry-pressure routing](#expiry-pressure-routing)) while affinity still keys on the shared bucket the family falls under. Such a family has its own quota clock and not its own pin, so anything that moves the pin moves both — a known limitation of pinning by bucket rather than by governing window, and the reason the cost bound below is stated per pin rather than per family.
 
+### Adaptive distribution
+
+Even distribution treats every account as interchangeable, which is wrong once a fleet is mixed. It sends a Pro account the same share as a Max 20x, so the small one hits its weekly wall days before the big one is half spent — and spreading evenly **fragments** the weekly windows: five accounts each left at 60% at reset is five windows' worth of credit thrown away, where four spent accounts and one untouched is the same work with the headroom kept where it can still be used.
+
+```json
+"distributeSessions": "adaptive"
+```
+
+Adaptive mode does the opposite of even: it concentrates new sessions on the account with the **least remaining weekly credit**, to finish that window off — while tapering its share away as it nears the switch threshold, so the account is spent down to the wall and never into it, and backing off when it is congested, so concentrating never costs response time. A session's pin, priority ordering, and the drain-on-disable behaviour are all unchanged.
+
+Plan size comes from authoritative account metadata; only dynamic behavior is learned from traffic:
+
+| Input | Source | Used for |
+| --- | --- | --- |
+| **Plan tier** | OAuth profile organization and seat tier, using the same persisted 1x/5x/20x mapping as quota summary. | Making “least remaining” comparable across differently sized subscriptions without estimating the subscription from traffic. |
+| **Tolerated concurrency** | AIMD: retreat below the load that upstream throttled, creep back up while running at the cap without trouble. Load is measured as active sessions plus requests in flight, the same figure the score compares against the cap. | The response-speed term: an account's share of *new sessions* decays as its load approaches the learned cap, so concentrating for quota reasons stops before the next session would just queue. It shapes placement only — it does not bound admission, and a request already on an account is never held back by it. |
+
+The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
+
+The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
+
+Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window. The burn-rate and concurrency learners run, and persist to the state file, in **every** mode — they have no effect on routing unless `distributeSessions` is `"adaptive"`, but what they have already observed is in hand the moment it is.
+
+**Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
+
+```
+> account-a (Max 20x) (oauth, prio 0) active 3 sess
+  Weekly   [███████████░░░░░░░] 62% reset 3d8h
+  Adaptive next · weight 36% of opus+  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0
+```
+
+`next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed session to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the sessions running at that moment keep their accounts, and only **new** sessions go back to plain quota-driven rotation. Affinity therefore winds down as those sessions finish rather than snapping, and a draining session whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of those sessions is done or idles out.
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the session whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a session making requests never idles out — so without this a long-lived session rides a rolled-over account for as long as it keeps talking.
