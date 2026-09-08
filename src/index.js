@@ -42,6 +42,7 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { startEventLoopMonitor } from './event-loop-monitor.js';
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -221,6 +222,10 @@ async function serverCommand() {
   // overnight leaves nothing behind to explain why.
   const crashLog = getCrashLogPath();
   installCrashHandlers(crashLog);
+  // Same motive as the crash log: when the process is wedged, the status
+  // endpoint cannot say so. The monitor leaves the evidence (one bounded warning
+  // per stall in the service log, lag figures under `server.eventLoop`).
+  const eventLoopMonitor = startEventLoopMonitor();
 
   const config = await loadOrCreateConfig();
   // Token writes below pair rows by entry id against a re-read of the file, so
@@ -547,6 +552,7 @@ async function serverCommand() {
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
+      eventLoop: eventLoopMonitor.status(),
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -673,6 +679,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
@@ -1072,8 +1079,17 @@ async function statusCommand() {
   const color = colorArg === 'always'
     || (colorArg !== 'never' && process.stdout.isTTY);
 
+  // A connection that is accepted and then never answered is a different
+  // failure from a refused one — a stalled or overloaded server rather than a
+  // stopped one — and without a deadline this command would just hang on it.
+  const configuredTimeout = Number(process.env.TEAMCLAUDE_STATUS_TIMEOUT_MS);
+  const timeoutMs = configuredTimeout > 0 ? configuredTimeout : 5_000;
+
   try {
-    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const res = await fetch(url, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     const data = await res.json();
     if (json) {
       console.log(JSON.stringify(data, null, 2));
@@ -1081,6 +1097,12 @@ async function statusCommand() {
     }
     console.log(renderStatus(data, { color }));
   } catch (err) {
+    if (err?.name === 'TimeoutError') {
+      console.error(`Proxy at localhost:${config.proxy.port} did not answer status within ${timeoutMs}ms.`);
+      console.error('The process may be overloaded or its event loop may be stalled.');
+      console.error(`Check the service log: ${logPath()}`);
+      process.exit(1);
+    }
     console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
