@@ -1380,6 +1380,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
+  // Taken before the walk, which can move the observation, and a request cannot
+  // confirm the stay its own selection began. A pinned request bypasses
+  // selection, so it consults no observation and is no evidence about a rest.
+  const restingGen = ctx.pinnedIndex == null
+    ? accountManager.observedGeneration(ctx.sessionId, ctx.model)
+    : null;
+
   // Select account, skipping any already tried (and failed) this request.
   // The model scopes availability so a Fable-exhausted account is skipped only
   // for Fable requests (it still serves other models).
@@ -1896,6 +1903,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     res.writeHead(upstreamRes.status, responseHeaders);
+
+    // The catch block's retry is guarded by `!res.headersSent`, so a stay
+    // confirmed once the headers are out has no retry behind it.
+    if (upstreamRes.status < 400) {
+      accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.provider);
+    }
 
     if (!upstreamRes.body) {
       const l = getLog();

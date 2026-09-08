@@ -74,7 +74,7 @@ export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows } | null }>,
+    //                                unescaped: { idx, windows } | null, gen }>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -272,7 +272,7 @@ export class SessionTracker {
       return null;
     }
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null });
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0 });
     return ref || null;
   }
 
