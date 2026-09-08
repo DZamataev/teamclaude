@@ -10,11 +10,21 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
   const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
-  const accounts = status.accounts || [];
-  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length);
+  // Listed in preference order, which is what an operator configured priority to
+  // mean: the account the fleet reaches for first is at the top, the last resort
+  // at the bottom. The payload arrives in config-file order, so an account moved
+  // to the back of the ladder still read as second in the list. Ties keep their
+  // configured order (the sort is stable), which is also the rotation cursor's.
+    const accounts = [...(status.accounts || [])].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length).map(p => safeLine(p, 64));
+  // This payload can come off the wire (`teamclaude status` against a running
+  // server), and account/route strings in it started life in an OAuth reply or
+  // a config file. Names are cut down once here and compared in that form, so a
+  // stripped account still matches a stripped current-account marker.
+  const currentAccount = status.currentAccount == null ? null : nameText(status.currentAccount);
 
   lines.push(paint.bold('TeamClaude status'));
-  lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
+  lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(currentAccount || 'none')}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
   // Only when something is blocked: a always-visible "Blocked" row would be
   // noise for the common case, but its ABSENCE is what made a blocked model
@@ -38,7 +48,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, status.currentAccount, paint, now));
+    lines.push(renderAccountHeader(account, currentAccount, paint, now));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
@@ -49,7 +59,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
-    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
+    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     lines.push('');
   }
 
@@ -75,6 +85,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 
   return lines.join('\n').trimEnd();
 }
+
+// A name-sized field, fit to print: an account or route name, a glob, a pin.
+const nameText = value => safeLine(value, 64);
 
 function renderUsageEntries(lines, entries, paint, now) {
   entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
@@ -139,7 +152,7 @@ export function spendLine(account, paint) {
   // Not enabled, but money was spent this month. Say why it is off now, since
   // "out_of_credits" and "the member turned it off" have different futures.
   const why = spend.userDisabled ? 'now disabled by the account holder'
-    : spend.disabledReason ? `now off (${spend.disabledReason})`
+    : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
 }
@@ -147,7 +160,7 @@ export function spendLine(account, paint) {
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
-  const text = UNAVAILABLE_TEXT[reason] || reason;
+  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
@@ -182,7 +195,7 @@ function routingLines(routes, blocked, paint) {
   if (!Array.isArray(routes) || routes.length === 0) return [];
   const lines = [paint.bold('Routing')];
   for (const route of routes) {
-    const globs = route.match || [];
+    const globs = (route.match || []).map(nameText);
     const match = globs.join(', ');
     // A route every one of whose globs is blocked can carry no traffic at all —
     // say so, rather than listing eligible accounts it will never reach.
@@ -191,9 +204,9 @@ function routingLines(routes, blocked, paint) {
     const accounts = routeBlocked
       ? paint.red('blocked')
       : (route.accounts || [])
-        .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
-    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
-    const pin = route.pinned ? paint.dim(` [pinned: ${route.pinned}]`) : '';
+        .map(a => (a.eligible ? paint.green(nameText(a.name)) : paint.red(nameText(a.name)))).join(' ') || paint.gray('(none)');
+    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${nameText(route.bucket)}]`) : '';
+    const pin = route.pinned ? paint.dim(` [pinned: ${nameText(route.pinned)}]`) : '';
     // padEnd on the raw text, color after, so ANSI codes don't throw off alignment.
     const label = paintRoute(paint, route.color, match.padEnd(16));
     lines.push(`  ${label} ${paint.dim('→')} ${accounts}${tag}${pin}`);
@@ -203,13 +216,14 @@ function routingLines(routes, blocked, paint) {
 }
 
 function renderAccountHeader(account, currentAccount, paint, now) {
-  const current = account.name === currentAccount;
+  const acctName = nameText(account.name);
+  const current = acctName === currentAccount;
   const marker = current ? paint.cyan('>') : ' ';
-  const name = current ? paint.bold(account.name) : account.name;
+  const shown = current ? paint.bold(acctName) : acctName;
   const status = formatAccountStatus(account, now, paint);
-  const org = account.orgName ? ` ${paint.dim(account.orgName)}` : '';
+  const org = account.orgName ? ` ${paint.dim(nameText(account.orgName))}` : '';
   const sess = account.sessions ? ` ${paint.dim(`${account.sessions} sess`)}` : '';
-  return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
@@ -230,7 +244,7 @@ function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
 
-  const status = account.status || 'unknown';
+  const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'
     ? paint.green(status)
     : status === 'throttled'
@@ -369,6 +383,16 @@ function quotaLines(account, now, paint) {
     const ratio = 1 - quota.requestsRemaining / quota.requestsLimit;
     lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint, cap('requests')));
   }
+  // A third-party backend publishes its own figure (a balance, a percentage —
+  // backend-quota.js decides). Drawn from the normalized reading alone: a bar
+  // when the provider reports a fraction, its text when it does not.
+  const backend = quota.backend;
+  if (backend?.text) {
+    const label = String(backend.label || 'Quota').padEnd(8);
+    const bar = backend.utilization != null ? `${usageBar(backend.utilization, paint)} ` : '';
+    lines.push(`${paint.dim(label)} ${bar}${backend.text}`);
+  }
+
   if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
   return lines;
 }
@@ -442,7 +466,7 @@ function formatAccountProbe(accountName, probe, now, paint) {
       ? paint.yellow('running')
       : row.status === 'never'
         ? paint.gray('never')
-        : paint.red(row.status || 'error');
+        : paint.red(safeLine(row.status, 32) || 'error');
   const last = parseTs(row.lastProbedAt || row.startedAt);
   const when = last ? ` ${formatAgo(last, now)}` : '';
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';

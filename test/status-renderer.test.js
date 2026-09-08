@@ -353,3 +353,45 @@ test('the blocked line names the cap as the reason', () => {
   status.accounts[0].unavailable = 'capped';
   assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
 });
+
+test('accounts are listed in priority order, not config order', () => {
+  const acct = (name, priority) => ({ name, type: 'oauth', status: 'active', priority, quota: {}, usage: {} });
+  const out = renderStatus({
+    currentAccount: 'first',
+    switchThreshold: 0.98,
+    // Config order puts the last-resort account second, which is how it reached
+    // the payload and how it used to render.
+    accounts: [acct('first', -1), acct('last-resort', 300), acct('fallback', 100)],
+  }, { color: false, now });
+
+  const order = out.split('\n').filter(l => /\(oauth, prio/.test(l))
+    .map(l => l.trim().replace(/^>\s*/, '').split(' ')[0]);
+  assert.deepEqual(order, ['first', 'fallback', 'last-resort']);
+});
+
+// Every account and route string in the payload can have come off the wire
+// (`teamclaude status` against a running server) or out of an OAuth reply, and
+// the output is printed straight to the operator's terminal.
+test('renderStatus strips control characters out of account and route strings', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const status = sampleStatus();
+  status.currentAccount = `a${CLIP}`;
+  status.accounts[0].name = `a${CLIP}`;
+  status.accounts[0].orgName = `Org\x1b[2J\r\nforged`;
+  status.accounts[0].type = `oauth\x9b2J`;
+  status.accounts[0].status = `weird${CLIP}`;
+  status.accounts[0].unavailable = `custom\x1b[2Jreason`;
+  status.accounts[0].quota.spend = { enabled: false, usedMinor: 500, currency: 'USD', disabledReason: `out\x1b[2J` };
+  status.probe.accounts[0].status = `boom${CLIP}`;
+  status.routes = [{
+    name: 'r', match: [`*fable*${CLIP}`], bucket: `b\x1b[2J`, pinned: `a${CLIP}`,
+    accounts: [{ name: `a${CLIP}`, eligible: true }, { name: `b\x1b[2J`, eligible: false }],
+  }];
+
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /[\x1b\x07\x9b\r]/);
+  assert.match(output, /^> a /m);           // still marked current after stripping
+  assert.match(output, /Blocked\s+custom/);
+  assert.match(output, /pinned: a/);
+  assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
+});
