@@ -23,8 +23,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   // stripped account still matches a stripped current-account marker.
   const currentAccount = status.currentAccount == null ? null : nameText(status.currentAccount);
 
+  // Only adaptive distribution swaps the Active row for a Serving row and lets
+  // the `>` marker follow the sessions; see formatActive for why the modes differ.
+  const adaptiveMode = status.sessions?.mode === 'adaptive';
+
   lines.push(paint.bold('TeamClaude status'));
-  lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(currentAccount || 'none')}`);
+  lines.push(`${paint.dim(activeLabel(adaptiveMode).padEnd(12))} ${formatActive(status, currentAccount, adaptiveMode, paint)}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
   // Only when something is blocked: a always-visible "Blocked" row would be
   // noise for the common case, but its ABSENCE is what made a blocked model
@@ -48,7 +52,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, currentAccount, paint, now));
+    lines.push(renderAccountHeader(account, currentAccount, paint, now, adaptiveMode));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
@@ -60,6 +64,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
+    const adaptive = adaptiveFor(status, nameText(account.name));
+    if (adaptive) lines.push(`  ${paint.dim('Adaptive'.padEnd(8))} ${formatAdaptive(adaptive, paint)}`);
     lines.push('');
   }
 
@@ -95,7 +101,11 @@ function renderUsageEntries(lines, entries, paint, now) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
     const last = parseTs(c.lastUsed);
     const lastText = last ? `, last ${formatAgo(last, now)}` : '';
-    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+    // WebSocket channels (Remote Control) are counted apart from requests and
+    // shown only where a client has opened one, so the row reads as before
+    // everywhere else.
+    const conns = c.connections ? `, ${c.connections} ws` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
   }
 }
 
@@ -215,14 +225,55 @@ function routingLines(routes, blocked, paint) {
   return lines;
 }
 
-function renderAccountHeader(account, currentAccount, paint, now) {
+// `currentAccount` is the ROTATION CURSOR. Under ADAPTIVE distribution that is
+// not the account serving the traffic: the adaptive picker scores every
+// candidate per session and never moves the cursor, so it is just where a
+// SESSION-LESS request would go, and reporting it as "Active" points at one
+// account while several are serving. Observed live: the cursor sat on an
+// account holding a 34% share while the account beside it held 66%.
+//
+// So the label follows the mode. Off — and in plain even distribution, whose
+// picker still walks from the cursor — the cursor is the active account and
+// the row reads as it always has. Adapting, the cursor is named for what it is
+// and the accounts actually carrying sessions are listed instead.
+function activeLabel(adaptiveMode) {
+  return adaptiveMode ? 'Serving' : 'Active';
+}
+
+// A session count off the wire: anything that is not a finite number is zero.
+function sessionCount(account) {
+  return Number.isFinite(account?.sessions) ? account.sessions : 0;
+}
+
+function formatActive(status, currentAccount, adaptiveMode, paint) {
+  if (!adaptiveMode) return paint.cyan(currentAccount || 'none');
+  const serving = (status.accounts || []).filter(a => sessionCount(a) > 0);
+  const cursor = paint.dim(`cursor ${currentAccount || 'none'}`);
+  if (!serving.length) {
+    // Nothing is running, so the cursor is the only answer there is — but say
+    // that it is the cursor, since the next request may not go there.
+    return `${paint.dim('idle')} ${cursor}`;
+  }
+  const named = serving
+    .sort((a, b) => sessionCount(b) - sessionCount(a))
+    .map(a => `${paint.cyan(nameText(a.name))} ${paint.dim(`${sessionCount(a)}`)}`)
+    .join(paint.dim(' · '));
+  return `${named}  ${cursor}`;
+}
+
+function renderAccountHeader(account, currentAccount, paint, now, followSessions = false) {
   const acctName = nameText(account.name);
-  const current = acctName === currentAccount;
+  // Under adaptive distribution the marker follows the sessions rather than the
+  // cursor, so the accounts flagged here are the ones the fleet is running on.
+  const current = followSessions ? sessionCount(account) > 0 : acctName === currentAccount;
   const marker = current ? paint.cyan('>') : ' ';
   const shown = current ? paint.bold(acctName) : acctName;
   const status = formatAccountStatus(account, now, paint);
   const org = account.orgName ? ` ${paint.dim(nameText(account.orgName))}` : '';
-  const sess = account.sessions ? ` ${paint.dim(`${account.sessions} sess`)}` : '';
+  const sessions = sessionCount(account);
+  const sess = sessions
+    ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
+    : '';
   return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
@@ -234,10 +285,88 @@ function formatSessions(sessions, paint) {
   const known = sessions.known || 0;
   const draining = sessions.draining || 0;
   let mode;
-  if (sessions.distribute) mode = paint.green('distributing');
+  // Name WHICH distribution is running: "distributing" and "adapting" pick
+  // different accounts for the same fleet, so an operator reading the line
+  // needs to know which rule produced what they are looking at.
+  if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
+}
+
+// Weekly buckets, named for the model family an operator thinks in rather than
+// for the quota field. 'unified7d' is deliberately "opus+": it is the SHARED
+// weekly bucket, so Opus, Haiku and anything unclassified all meter there
+// together — calling it "opus" would misreport the other two as absent.
+const BUCKET_LABELS = {
+  unified7d: 'opus+',
+  unified7dFable: 'fable',
+  unified7dSonnet: 'sonnet',
+};
+
+// " (opus+ 2, fable 1)" — which families an account's sessions are on. A session
+// holding two families on one account appears in both, so these can sum to more
+// than the total they follow; that is the same double-count the per-account
+// totals already carry against `active`, for the same reason.
+//
+// Suppressed when there is only one family in play: "3 sess (opus+ 3)" adds a
+// parenthesis and no information, and the breakdown exists to show a split.
+function formatSessionBuckets(byBucket) {
+  const entries = Object.entries(byBucket || {}).filter(([, n]) => Number.isFinite(n) && n > 0);
+  if (entries.length < 2) return '';
+  entries.sort((a, b) => b[1] - a[1]);
+  return ` (${entries.map(([b, n]) => `${bucketLabel(b)} ${n}`).join(', ')})`;
+}
+
+// A bucket key is a quota field name on our side, but it arrives in the status
+// payload like everything else, so an unknown one is printed stripped and short.
+function bucketLabel(key) {
+  return BUCKET_LABELS[key] || safeLine(key, 24);
+}
+
+// A number in the adaptive readout, or `?` when the payload did not carry one:
+// an older server omits fields, a hostile one sends strings, and neither may
+// throw inside `teamclaude status`.
+function pct(value, digits) {
+  return Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '?';
+}
+function num(value, digits = 0) {
+  return Number.isFinite(value) ? value.toFixed(digits) : '?';
+}
+
+// The adaptive row for one account, or null when the mode is off (getStatus
+// sends an empty list) or this account predates the snapshot.
+// Matched on the stripped name, the form the account header was rendered in.
+function adaptiveFor(status, name) {
+  const rows = Array.isArray(status.adaptive) ? status.adaptive : [];
+  return rows.find(r => r && typeof r === 'object' && nameText(r.name) === name) || null;
+}
+
+// "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
+//  ·  conc 6"
+//
+// `next` is the deterministic routing result. `weight` is the account's score
+// normalized across competitors, useful for explaining why it won without
+// misrepresenting the picker as a weighted random draw.
+function formatAdaptive(a, paint) {
+  const parts = [];
+  const family = bucketLabel(a.bucket);
+  const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
+  parts.push(a.weight == null
+    // Every candidate scored zero: the whole tier is inside its reserve, so
+    // there is no weight to report and saying "0%" everywhere would imply the
+    // router had stopped, which it has not.
+    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
+  parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
+  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+  parts.push(a.planWeight == null
+    ? paint.dim('plan unknown')
+    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
+  parts.push(`conc ${num(a.concCap, 1)}`);
+  const line = parts.join(paint.dim('  ·  '));
+  return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
 
 function formatAccountStatus(account, now, paint) {

@@ -206,6 +206,17 @@ test('renderStatus prints configured usage dimensions and sanitizes their labels
   assert.doesNotMatch(output, /\x1b\[31m/);
 });
 
+test('renderStatus shows a client\'s WebSocket connections apart from its requests', () => {
+  const status = sampleStatus();
+  status.clients = {
+    alice: { requests: 2, connections: 1, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    bob: { requests: 1, connections: 0, inputTokens: 10, outputTokens: 5 },
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /alice\s+2 req, 1 ws, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /bob\s+1 req, 10 in \/ 5 out/, 'no channel, no column');
+});
+
 test('renderStatus never grows a per-session section', () => {
   // Sessions are unbounded caller-supplied ids: a terminal renderer that
   // printed one line each would bury the whole status readout. The per-session
@@ -352,6 +363,109 @@ test('the blocked line names the cap as the reason', () => {
   const status = cappedStatus({ unified7d: 0.7 }, { unified7d: 0.6 });
   status.accounts[0].unavailable = 'capped';
   assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
+});
+
+// ── The Active/Serving row under session distribution ───────────────────────
+//
+// `currentAccount` is the rotation cursor. Under ADAPTIVE distribution the
+// picker never moves it, so it names where a SESSION-LESS request would go —
+// not what is serving. Reporting it as "Active" pointed at one account while
+// several were running. Even distribution still walks from the cursor, so it
+// keeps the plain Active row.
+
+function distributedStatus(mode) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: 0.98,
+    sessions: { active: 12, known: 12, distribute: mode !== 'off', mode },
+    accounts: [
+      { name: 'a', type: 'oauth', priority: 0, status: 'active', sessions: 3, quota: {}, usage: {} },
+      { name: 'b', type: 'oauth', priority: 0, status: 'active', sessions: 9, quota: {}, usage: {} },
+      { name: 'c', type: 'oauth', priority: 0, status: 'active', sessions: 0, quota: {}, usage: {} },
+    ],
+  };
+}
+
+test('distribution off: the cursor is the active account, as before', () => {
+  const s = distributedStatus('off');
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  // Only the cursor is marked.
+  assert.match(out, /^> a \(oauth/m);
+  assert.match(out, /^ {2}b \(oauth/m);
+});
+
+test('distributing: the row names every account actually serving, plus the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.doesNotMatch(out, /^Active/m);
+  // Busiest first, each with its session count, and the cursor named as such.
+  assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
+});
+
+test('distributing: the marker follows the sessions, not the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.match(out, /^> a \(oauth/m, 'a carries sessions');
+  assert.match(out, /^> b \(oauth/m, 'b carries sessions and is NOT the cursor');
+  assert.match(out, /^ {2}c \(oauth/m, 'c carries none');
+});
+
+test('distributing but idle: says so rather than implying the cursor is serving', () => {
+  const s = distributedStatus('adaptive');
+  for (const a of s.accounts) a.sessions = 0;
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Serving {6}idle cursor a$/m);
+});
+
+test('even mode keeps the Active row and the cursor marker', () => {
+  const out = renderStatus(distributedStatus('even'), { color: false, now });
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  assert.match(out, /^> a \(oauth/m, 'the cursor is marked');
+  assert.match(out, /^ {2}b \(oauth/m, 'b carries sessions but is not the cursor');
+});
+
+test('adaptive diagnostics name the next target, score weight, and family split', () => {
+  const s = distributedStatus('adaptive');
+  s.accounts[0].sessionsByBucket = { unified7d: 2, unified7dFable: 1 };
+  s.adaptive = [{
+    name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true,
+    next: true, weight: 0.6, sessions: 3, inFlight: 1,
+    headroom: 0.28, threshold: 0.98, planWeight: 20, concCap: 6,
+  }];
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^> a .*3 sess \(opus\+ 2, fable 1\)$/m);
+  assert.match(out, /Adaptive\s+next · weight 60% of opus\+/);
+  assert.match(out, /plan 20x/);
+});
+
+// The adaptive rows come off the wire like everything else. An older server
+// omits fields and a hostile one sends strings where numbers belong; neither
+// may throw inside `teamclaude status` or reach the terminal unstripped.
+test('a hostile adaptive row renders as ? fields, not a throw or an escape', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const s = distributedStatus('adaptive');
+  s.accounts[0].name = `a${CLIP}`;
+  // A string count and a NaN are dropped; the escaped key is stripped.
+  s.accounts[0].sessionsByBucket = { [`unified7d\x1b[2J`]: 2, unified7dFable: 1, other: '9', bad: NaN };
+  s.adaptive = [
+    null,
+    'garbage',
+    {
+      name: `a${CLIP}`, bucket: `opus\x1b[2Jforged`, window: `w\r\n`, competing: true,
+      next: 'yes', weight: 'lots', sessions: '3', inFlight: null,
+      headroom: Infinity, threshold: undefined, planWeight: 'x', concCap: '6',
+    },
+  ];
+  let out;
+  assert.doesNotThrow(() => { out = renderStatus(s, { color: false, now }); });
+  assert.doesNotMatch(out, /[\x1b\x07\x9b\r]/);
+  assert.match(out, /Adaptive\s+next · weight \? of opus forged/);
+  assert.match(out, /\? sess \/ \? inflight/);
+  assert.match(out, /head \? of \?/);
+  assert.match(out, /plan \?x/);
+  assert.match(out, /conc \?/);
+  assert.match(out, /^> a .*3 sess \(unified7d 2, fable 1\)$/m);
 });
 
 test('accounts are listed in priority order, not config order', () => {

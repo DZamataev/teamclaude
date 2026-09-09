@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -249,7 +249,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         socket.destroy();
         return;
       }
-      relayUpgrade(req, socket, head, target, sx);
+      // The CONNECT's client identity is bound to this listener (see getServer),
+      // so the channel is attributed the way the requests in the tunnel are.
+      relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
     });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
@@ -492,8 +494,9 @@ export function resolveConnectAuth(req, socket, proxyConfig) {
   }
   // Loopback is exempt from the key requirement, but a valid key it DID present
   // still names it (matching the HTTP gate, where a local caller with a client
-  // key is attributed like any other).
-  if (!auth.ok && isLoopbackAddr(socket?.remoteAddress)) return { ok: true, client: null };
+  // key is attributed like any other). Same exemption as the other two gates,
+  // so a forwarded request or `trustLoopback: false` closes it here too.
+  if (!auth.ok && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null };
   return auth;
 }
 

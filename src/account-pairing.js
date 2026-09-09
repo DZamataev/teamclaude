@@ -14,7 +14,7 @@
 // evidence and admits no ambiguity: it survives the refresh that rewrites the
 // credential, and it separates two entries that agree on everything else.
 
-import { sameIdentity } from './identity.js';
+import { sameIdentity, sameOrg } from './identity.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -43,21 +43,6 @@ export function configIndexFor(configAccounts, managerAccounts, mgrIdx) {
   return configAccounts.findIndex(a => a?.id === id);
 }
 
-/**
- * The account list to write to disk: in-memory config entries carrying live
- * credentials from the account each was built into, merged over the on-disk
- * entry so disk-only fields (e.g. importFrom) survive. An entry with no account
- * keeps what it has — there is no live credential to write.
- *
- * The config-to-disk lookup is a different axis and stays on identity, which is
- * not claimed one-to-one: two entries identity cannot separate both merge over
- * the same disk record. No credential moves that way, because the live one above
- * overrides whatever the lookup found — but the record's other fields do move,
- * and `importFrom` among them names the file an entry takes its credential from
- * at the next start. An entry can therefore pick up a delegation that was never
- * its own and read another's credential a restart later. Pairing by id does not
- * reach this axis.
- */
 /**
  * Whether this entry's OAuth token belongs in `config.json` at all.
  *
@@ -118,8 +103,69 @@ export function clearRemovedAccountIds(config) {
   if (config?.[REMOVED]) config[REMOVED].clear();
 }
 
+/**
+ * Which disk row each config entry merges over, as a Map of config index to disk
+ * index. A row is claimed by at most one entry.
+ *
+ * Evidence before guesswork, in four passes: an exact id, then an account uuid
+ * with an organization both records name, then an account uuid alone, then the
+ * display name. `sameIdentity` collapses the last three — it compares uuids
+ * only when both sides have one, tolerates an organization either side has not
+ * stored, and falls back to the name otherwise — so calling it alone lets an
+ * entry holding a uuid settle for a namesake's row, or an entry with no
+ * organization settle for the row of the same person in another one (#327).
+ * Claiming consumes, so that row is then taken from the entry it belonged to,
+ * and `importFrom` on it names the file an entry reads its credential from at
+ * the next start. findUpsertTarget in identity.js puts the same questions in
+ * this order for the login axis.
+ *
+ * Ids can disagree with disk — a file written before the field existed, or
+ * re-minted by another process — which is why they cannot be the only pass.
+ *
+ * A row the operator removed is claimed by nobody. Removal consults `removedIds`
+ * where rows are carried over, so the removed row is not appended as its own
+ * entry; without the same check here, the identity fallback matched that row
+ * to a surviving namesake and merged its fields in — including `importFrom`,
+ * which names the file an entry reads its credential from at the next start, so
+ * the survivor was left pointing at the deleted account's credentials (#329).
+ */
+function claimDiskRows(configAccounts, diskAccounts, removedIds) {
+  const rowFor = new Map();
+  const taken = new Set();
+  for (const [d, diskAcct] of diskAccounts.entries()) {
+    if (diskAcct?.id && removedIds.has(diskAcct.id)) taken.add(d);
+  }
+  const claim = (i, matches) => {
+    for (const [d, diskAcct] of diskAccounts.entries()) {
+      if (taken.has(d) || !matches(diskAcct)) continue;
+      taken.add(d);
+      rowFor.set(i, d);
+      return;
+    }
+  };
+  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid === a.accountUuid && sameOrg(d, a) === true); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid && sameIdentity(d, a)); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i)) claim(i, d => sameIdentity(d, a)); });
+  return rowFor;
+}
+
+/**
+ * The account list to write to disk: in-memory config entries carrying live
+ * credentials from the account each was built into, merged over the on-disk
+ * entry so disk-only fields (e.g. importFrom) survive. An entry with no account
+ * keeps what it has — there is no live credential to write.
+ *
+ * The config-to-disk lookup is a different axis from the config-to-manager one,
+ * and claimDiskRows is where it is decided: one row per entry, one entry per row.
+ */
 export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
-  const merged = configAccounts.map(a => {
+  // loadConfig normalises a missing list, but this is the function that threw
+  // on one (#330), so it holds its own contract too: no rows is an empty list.
+  if (!Array.isArray(diskAccounts)) diskAccounts = [];
+  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds);
+
+  const merged = configAccounts.map((a, i) => {
     const am = managerAccountFor(managerAccounts, a);
     const live = am && ownsInlineToken(a) ? {
       ...a,
@@ -127,7 +173,7 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       refreshToken: am.refreshToken,
       expiresAt: am.expiresAt,
     } : a;
-    const diskAcct = diskAccounts.find(d => sameIdentity(d, a));
+    const diskAcct = diskAccounts[rowFor.get(i)];
     return diskAcct ? { ...diskAcct, ...live } : live;
   });
 
@@ -137,12 +183,19 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
   // server runs — was silently dropped by the next save (#205). The refresh
   // handler already re-reads disk for this reason; the save had no equivalent.
   //
+  // A claimed row is one the merge above already folded into an entry, so this
+  // loop and the claim have to agree on what counts as already represented. The
+  // id alone does not agree: two processes mint different ids for the same
+  // pre-id row, so every row would look absent and the whole list would double.
+  //
   // Except the ones the operator removed: removal is itself a save, so without
   // that check this would resurrect the account being deleted, on the very
   // write that was meant to delete it.
+  const claimed = new Set(rowFor.values());
   const keptIds = new Set(merged.map(a => a?.id).filter(Boolean));
-  for (const diskAcct of diskAccounts) {
-    if (!diskAcct?.id) continue;                 // pre-id row; identity above covers it
+  for (const [d, diskAcct] of diskAccounts.entries()) {
+    if (claimed.has(d)) continue;
+    if (!diskAcct?.id) continue;                 // nothing for removedIds to match; adopting it could undo a removal
     if (keptIds.has(diskAcct.id)) continue;
     if (removedIds.has(diskAcct.id)) continue;
     merged.push(diskAcct);
