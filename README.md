@@ -43,6 +43,8 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 
 ```bash
 teamclaude accounts          # accounts with tier and token status
+teamclaude client add mbp    # create a named per-client proxy key
+teamclaude client list       # list client keys (masked by default)
 teamclaude status            # live proxy status, needs a running server
 teamclaude watch             # read-only terminal dashboard, refreshes every minute
 teamclaude disable <name>    # pause an account without removing it
@@ -64,6 +66,8 @@ teamclaude watch
 It shows the same account, routing, quota, probe, and keep-warm details as `teamclaude status`, together with a short summary from Anthropic's public service-status page. When per-client keys are configured, the client section is limited to the five clients with the highest combined input and output token usage; each row also shows its request count. The dashboard fetches both views once a minute, builds the complete frame before repainting, and preserves the colored quota bars without clearing and flashing the terminal. The previous frame stays visible while each refresh is in progress; `Ctrl+C` exits and restores the cursor.
 
 Unlike `teamclaude attach`, `watch` is deliberately read-only and has no keyboard controls or activity stream. Use `attach` when you need the interactive dashboard and `watch` for a compact operational overview over SSH. No commands beyond the installed TeamClaude package are required.
+
+Manage the per-client keys that feed the client ranking with `teamclaude client add <name>`, `teamclaude client list [--show-keys]`, and `teamclaude client remove <name>`. `add` prints the generated key once and applies it to a running server immediately. `list` masks secrets unless `--show-keys` is explicitly requested. `remove` revokes every configured key for that name; it refuses a client entry that duplicates `proxy.apiKey`, because deleting only the entry would leave the shared key valid and merely make its traffic unattributed.
 
 ## Claude Code quota status line
 

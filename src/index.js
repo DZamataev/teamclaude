@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
@@ -84,6 +85,12 @@ const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFa
 
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
 
+const CLIENT_USAGE = [
+  'Usage: teamclaude client add <name>',
+  '       teamclaude client list [--show-keys]',
+  '       teamclaude client remove <name>',
+].join('\n');
+
 // What each mode writes to the config, and what to say once it is set. Keyed by
 // the mode `distributionMode` resolves to, so the command and the router cannot
 // disagree about what a setting means.
@@ -137,6 +144,10 @@ switch (command) {
     break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'client':
+    await clientCommand();
     process.exit(0);
     break;
   case 'switch':
@@ -1237,6 +1248,135 @@ async function switchCommand() {
 
 // ── accounts ────────────────────────────────────────────────
 
+async function clientCommand() {
+  const subcommand = args[1];
+  if (subcommand === 'list') {
+    if (args.length > 3 || (args[2] && args[2] !== '--show-keys')) clientUsageError();
+    const config = await loadOrCreateConfig();
+    const entries = usableConfiguredClients(config.proxy?.clientKeys);
+    if (!entries.length) {
+      console.log('No client keys configured.');
+      return;
+    }
+    const showKeys = args[2] === '--show-keys';
+    for (const entry of entries) {
+      const key = showKeys ? entry.key : maskClientKey(entry.key);
+      const shared = entry.key === config.proxy?.apiKey ? '  (shared apiKey)' : '';
+      console.log(`  ${sanitizeText(entry.name).padEnd(20)} ${key}${shared}`);
+    }
+    return;
+  }
+
+  if (subcommand === 'add') {
+    if (args.length !== 3) clientUsageError();
+    const name = normalizeClientName(args[2]);
+    if (!name) clientUsageError('Expected a valid client name without control characters.');
+    let key;
+    let config;
+    let reloadKey;
+    try {
+      config = await atomicConfigUpdate(disk => {
+        disk.proxy ||= {};
+        reloadKey = reloadCredential(disk);
+        const entries = Array.isArray(disk.proxy.clientKeys) ? disk.proxy.clientKeys : [];
+        if (entries.some(entry => normalizeClientName(entry?.name) === name)) {
+          throw clientCommandError(`Client "${name}" already exists.`);
+        }
+        const existingKeys = new Set(entries.map(entry => entry?.key).filter(Boolean));
+        do key = `tc-${randomBytes(32).toString('base64url')}`;
+        while (existingKeys.has(key) || key === disk.proxy.apiKey);
+        disk.proxy.clientKeys = [...entries, { name, key }];
+      });
+    } catch (err) {
+      if (err?.clientCommand) clientUsageError(err.message);
+      throw err;
+    }
+    console.log(`Added client "${name}".`);
+    console.log(`Key: ${key}`);
+    await notifyClientMutation(config, reloadKey);
+    return;
+  }
+
+  if (subcommand === 'remove') {
+    if (args.length !== 3) clientUsageError();
+    const name = configuredClientName(args[2]);
+    if (!name) clientUsageError('Expected a non-empty client name.');
+    let removed = 0;
+    let config;
+    let reloadKey;
+    try {
+      config = await atomicConfigUpdate(disk => {
+        reloadKey = reloadCredential(disk);
+        const entries = Array.isArray(disk.proxy?.clientKeys) ? disk.proxy.clientKeys : [];
+        const matches = entries.filter(entry => configuredClientName(entry?.name) === name);
+        if (!matches.length) throw clientCommandError(`Unknown client "${sanitizeText(name)}".`);
+        if (matches.some(entry => entry?.key === disk.proxy?.apiKey)) {
+          throw clientCommandError(`Client "${sanitizeText(name)}" uses proxy.apiKey; that key would remain valid and become unattributed. Rotate or remove proxy.apiKey first.`);
+        }
+        removed = matches.length;
+        disk.proxy.clientKeys = entries.filter(entry => configuredClientName(entry?.name) !== name);
+      });
+    } catch (err) {
+      if (err?.clientCommand) clientUsageError(err.message);
+      throw err;
+    }
+    console.log(`Removed ${removed} ${removed === 1 ? 'key' : 'keys'} for client "${sanitizeText(name)}".`);
+    await notifyClientMutation(config, reloadKey);
+    return;
+  }
+
+  clientUsageError();
+}
+
+function usableConfiguredClients(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .map(entry => ({ name: configuredClientName(entry?.name), key: entry?.key }))
+    .filter(entry => entry.name && typeof entry.key === 'string' && entry.key);
+}
+
+function configuredClientName(value) {
+  if (typeof value !== 'string') return null;
+  return value.trim() || null;
+}
+
+function normalizeClientName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.trim();
+  return name && !/\p{C}/u.test(name) ? name : null;
+}
+
+function maskClientKey(key) {
+  if (key.length <= 12) return '*'.repeat(key.length);
+  return `${key.slice(0, 5)}…${key.slice(-4)}`;
+}
+
+function reloadCredential(config) {
+  if (typeof config.proxy?.apiKey === 'string' && config.proxy.apiKey) return config.proxy.apiKey;
+  return usableConfiguredClients(config.proxy?.clientKeys)[0]?.key || '';
+}
+
+async function notifyClientMutation(config, apiKey) {
+  try {
+    await notifyRunningServer(config, { strict: true, apiKey });
+  } catch (err) {
+    console.error(`Client configuration was saved, but the running server was not reloaded: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function clientCommandError(message) {
+  const error = new Error(message);
+  error.clientCommand = true;
+  return error;
+}
+
+function clientUsageError(message = null) {
+  if (message) console.error(message);
+  console.error(CLIENT_USAGE);
+  process.exit(1);
+}
+
 async function accountsCommand() {
   const config = await loadOrCreateConfig();
   const verbose = args.includes('-v') || args.includes('--verbose');
@@ -2013,6 +2153,7 @@ Commands:
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   accounts            List configured accounts
+  client <sub>        Manage per-client proxy keys: add | list | remove
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
@@ -2301,19 +2442,25 @@ function startTerminalTitleUpdater(accountManager) {
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
 // changes; account removals still need a restart.
-async function notifyRunningServer(config) {
+async function notifyRunningServer(config, { strict = false, apiKey = config?.proxy?.apiKey || '' } = {}) {
   const port = config?.proxy?.port;
   if (!port) return;
   try {
     const res = await fetch(`http://localhost:${port}/teamclaude/reload`, {
       method: 'POST',
-      headers: { 'x-api-key': config.proxy?.apiKey || '' },
+      headers: { 'x-api-key': apiKey },
     });
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
       console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+    } else if (strict) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(typeof data.error === 'string' ? data.error : `HTTP ${res.status}`);
     }
-  } catch { /* no server running — nothing to notify */ }
+  } catch (err) {
+    if (err?.cause?.code === 'ECONNREFUSED') return; // no server running
+    if (strict) throw err;
+  }
 }
 
 // Quick liveness probe: is something listening on the local proxy port?

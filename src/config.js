@@ -182,6 +182,29 @@ export async function saveConfig(config) {
 // invalid_grant and need a re-login. Chaining the updates keeps every write.
 let configUpdateChain = Promise.resolve();
 
+const CONFIG_LOCK_TIMEOUT_MS = 15_000;
+
+async function acquireConfigLock() {
+  const configPath = await realpath(getConfigPath()).catch(() => getConfigPath());
+  const lockPath = `${configPath}.lock`;
+  const started = Date.now();
+  while (true) {
+    try {
+      const handle = await open(lockPath, 'wx', 0o600);
+      return async () => {
+        await handle.close().catch(() => {});
+        await unlink(lockPath).catch(() => {});
+      };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      if (Date.now() - started >= CONFIG_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for another TeamClaude process to update ${configPath}; if none is running, remove the stale lock ${lockPath}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 10 + Math.floor(Math.random() * 20)));
+    }
+  }
+}
+
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
@@ -191,10 +214,15 @@ let configUpdateChain = Promise.resolve();
  */
 export function atomicConfigUpdate(updater) {
   const run = async () => {
-    const config = await loadConfig() || createDefaultConfig();
-    await updater(config);
-    await saveConfig(config);
-    return config;
+    const release = await acquireConfigLock();
+    try {
+      const config = await loadConfig() || createDefaultConfig();
+      await updater(config);
+      await saveConfig(config);
+      return config;
+    } finally {
+      await release();
+    }
   };
   const result = configUpdateChain.then(run, run);
   configUpdateChain = result.then(() => {}, () => {});

@@ -144,6 +144,9 @@ teamclaude run               # Run Claude Code through the proxy
 teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
+teamclaude client add <name> # Generate and add a named client key
+teamclaude client list       # List clients with masked keys
+teamclaude client remove <name>
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude watch             # Open the read-only terminal dashboard
 teamclaude attach            # Open the live dashboard against a running server
@@ -169,6 +172,8 @@ teamclaude help              # Show all commands
 ```
 
 `teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output.
+
+`teamclaude client add <name>` generates a 256-bit `tc-...` proxy key, writes it atomically under `proxy.clientKeys`, applies it to a running server, and prints the full key once for transfer to that client. `teamclaude client list` masks configured keys; add `--show-keys` to reveal them explicitly. `teamclaude client remove <name>` removes every key bearing that name and reloads the server. A client entry whose key is also `proxy.apiKey` cannot be removed this way: the shared credential would still authenticate, so the command refuses instead of reporting a false revocation. Rotate or remove the shared key first.
 
 `teamclaude watch` opens a read-only terminal dashboard that refreshes every minute. It combines the color account, routing, quota, probe, and keep-warm output from `teamclaude status` with a one-line summary from Anthropic's public service-status page. When `proxy.clientKeys` attributes traffic to clients, `watch` shows the five clients with the highest combined input and output token usage, with the request count beside each total; the one-shot `teamclaude status` output remains unbounded. Each complete frame replaces the previous one without clearing the terminal, so the display does not flash while either status is being fetched. If Anthropic's page cannot be read, its line reports `UNKNOWN`; if the local proxy is temporarily unreachable, the TeamClaude line reports `UNAVAILABLE` and the next scheduled refresh tries again. Press `Ctrl+C` to exit.
 
