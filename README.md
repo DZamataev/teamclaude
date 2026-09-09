@@ -61,7 +61,7 @@ Run the read-only dashboard in a terminal connected to the TeamClaude host:
 teamclaude watch
 ```
 
-It shows the same account, routing, quota, probe, and keep-warm details as `teamclaude status`, together with a short summary from Anthropic's public service-status page. The dashboard fetches both views once a minute, builds the complete frame before repainting, and preserves the colored quota bars without clearing and flashing the terminal. The previous frame stays visible while each refresh is in progress; `Ctrl+C` exits and restores the cursor.
+It shows the same account, routing, quota, probe, and keep-warm details as `teamclaude status`, together with a short summary from Anthropic's public service-status page. When per-client keys are configured, the client section is limited to the five clients with the highest combined input and output token usage; each row also shows its request count. The dashboard fetches both views once a minute, builds the complete frame before repainting, and preserves the colored quota bars without clearing and flashing the terminal. The previous frame stays visible while each refresh is in progress; `Ctrl+C` exits and restores the cursor.
 
 Unlike `teamclaude attach`, `watch` is deliberately read-only and has no keyboard controls or activity stream. Use `attach` when you need the interactive dashboard and `watch` for a compact operational overview over SSH. No commands beyond the installed TeamClaude package are required.
 

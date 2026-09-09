@@ -48,7 +48,7 @@ export function resolveControlHost(config, env = process.env) {
 export function renderWatchFrame({ teamClaudeStatus, teamClaudeError, anthropicStatus, now = Date.now() }) {
   const timestamp = timestampFormat.format(new Date(now));
   const status = teamClaudeStatus
-    ? renderStatus(teamClaudeStatus, { color: true, now })
+    ? renderStatus(teamClaudeStatus, { color: true, now, maxClients: 5 })
     : `TeamClaude: UNAVAILABLE${teamClaudeError ? ` — ${cleanLine(teamClaudeError)}` : ''}`;
   return `TeamClaude dashboard — ${timestamp}\n\n${anthropicStatus}\n\n${status}`;
 }

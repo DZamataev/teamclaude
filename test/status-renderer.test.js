@@ -211,10 +211,15 @@ test('renderStatus shows a client\'s WebSocket connections apart from its reques
   status.clients = {
     alice: { requests: 2, connections: 1, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
     bob: { requests: 1, connections: 0, inputTokens: 10, outputTokens: 5 },
+    charlie: { requests: 3, inputTokens: 30, outputTokens: 3 },
+    dana: { requests: 4, inputTokens: 40, outputTokens: 4 },
+    erin: { requests: 5, inputTokens: 50, outputTokens: 5 },
+    frank: { requests: 6, inputTokens: 60, outputTokens: 6 },
   };
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /alice\s+2 req, 1 ws, 1.0k in \/ 250 out, last 1m ago/);
   assert.match(output, /bob\s+1 req, 10 in \/ 5 out/, 'no channel, no column');
+  assert.match(output, /frank\s+6 req, 60 in \/ 6 out/, 'plain status remains unbounded');
 });
 
 test('renderStatus never grows a per-session section', () => {
