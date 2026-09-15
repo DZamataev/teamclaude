@@ -51,8 +51,13 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
+  // Whether the account rows print a session count at all. True as soon as any
+  // account carries one, so the zeros that make the distribution readable
+  // appear together with the nonzero figure they are being compared against.
+  const showAccountSessions = accounts.some(a => sessionCount(a) > 0);
+
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, currentAccount, paint, now, adaptiveMode));
+    lines.push(renderAccountHeader(account, currentAccount, paint, now, adaptiveMode, showAccountSessions));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
@@ -74,7 +79,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const clients = Object.entries(status.clients || {});
   if (clients.length) {
     lines.push(paint.bold('Clients'));
-    renderUsageEntries(lines, clients, paint, now, maxClients);
+    renderUsageEntries(lines, clients, paint, now, maxClients, status.sessions?.perClient);
     lines.push('');
   }
 
@@ -95,8 +100,19 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 // A name-sized field, fit to print: an account or route name, a glob, a pin.
 const nameText = value => safeLine(value, 64);
 
-function renderUsageEntries(lines, entries, paint, now, limit = Infinity) {
-  entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+function renderUsageEntries(lines, entries, paint, now, limit = Infinity, perClient = null) {
+  // Tokens are a lifetime total, so on their own they rank a machine that was
+  // busy yesterday above one holding three conversations right now. Where the
+  // list is CAPPED (watch's top five) that is not a matter of order but of
+  // visibility: the client the operator is watching can fall off the bottom.
+  // So live sessions come first, and tokens break the tie among clients that
+  // hold none — which is every client when session counts are absent, leaving
+  // the previous ordering byte-identical.
+  entries.sort(([an, a], [bn, b]) => {
+    const activeDiff = clientActiveSessions(perClient, bn) - clientActiveSessions(perClient, an);
+    if (activeDiff) return activeDiff;
+    return ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0));
+  });
   for (const [name, c] of entries.slice(0, limit)) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
     const last = parseTs(c.lastUsed);
@@ -105,8 +121,41 @@ function renderUsageEntries(lines, entries, paint, now, limit = Infinity) {
     // shown only where a client has opened one, so the row reads as before
     // everywhere else.
     const conns = c.connections ? `, ${c.connections} ws` : '';
-    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))}${formatClientSessions(perClient, name, paint)} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
   }
+}
+
+// How many sessions a named client is holding, off the wire: anything that is
+// not a finite number is none. Shared with the sort, so the row that is printed
+// and the reason it was ranked there cannot disagree.
+function clientActiveSessions(perClient, name) {
+  const row = perClient && typeof perClient === 'object' ? perClient[name] : null;
+  return Number.isFinite(row?.active) ? row.active : 0;
+}
+
+// " 3 sess" — the conversations this client is holding NOW, ahead of the
+// lifetime counters on the same row so the two are not read as one series.
+// A client with no live session but some remembered is shown as "0/2 sess": the
+// distinction between idle and gone is exactly what the known window is for,
+// and a bare blank would say the client is not there at all. A client the
+// tracker has never seen (its traffic predates the header, or it only ever used
+// the shared key) holds the column blank rather than claiming zero, since no
+// session was attributed to it either way.
+function formatClientSessions(perClient, name, paint) {
+  // No session map at all (an older server, or a fleet where no session was
+  // ever attributed to a named client): the column does not exist and every row
+  // renders exactly as it did before.
+  if (!perClient || typeof perClient !== 'object' || !Object.keys(perClient).length) return '';
+  const row = perClient[name];
+  const active = Number.isFinite(row?.active) ? row.active : 0;
+  const known = Number.isFinite(row?.known) ? row.known : 0;
+  // A fixed-width column once the server reports session counts at all, so the
+  // clients holding none still line their request counters up with the ones
+  // that do. Without the padding the marker would shift every row it appears
+  // on, which is worse than a little blank space in a table read by eye.
+  if (!known) return ' '.repeat(10);
+  const text = active === known ? `${active} sess` : `${active}/${known} sess`;
+  return ` ${(active ? paint.green : paint.dim)(text.padStart(9))}`;
 }
 
 function usageDimensionTitle(name) {
@@ -261,7 +310,7 @@ function formatActive(status, currentAccount, adaptiveMode, paint) {
   return `${named}  ${cursor}`;
 }
 
-function renderAccountHeader(account, currentAccount, paint, now, followSessions = false) {
+function renderAccountHeader(account, currentAccount, paint, now, followSessions = false, showSessions = false) {
   const acctName = nameText(account.name);
   // Under adaptive distribution the marker follows the sessions rather than the
   // cursor, so the accounts flagged here are the ones the fleet is running on.
@@ -271,7 +320,12 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   const status = formatAccountStatus(account, now, paint);
   const org = account.orgName ? ` ${paint.dim(nameText(account.orgName))}` : '';
   const sessions = sessionCount(account);
-  const sess = sessions
+  // Once the fleet is carrying sessions at all, say `0 sess` rather than
+  // nothing: distribution is read by comparing the accounts against each
+  // other, and an account that was given none is the interesting row. A blank
+  // there is indistinguishable from a server that does not report the figure,
+  // which is why the zero is printed only when some account has a nonzero one.
+  const sess = sessions || showSessions
     ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
     : '';
   return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;

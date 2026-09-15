@@ -432,3 +432,53 @@ test('beginRequest sweeps expired sessions on the same throttle as touch', () =>
   assert.equal(st.sessions.has('s1'), false, 'the idle session was shed without touch() or stats()');
   assert.equal(st.sessions.size, 1);
 });
+
+// The Clients block reports lifetime requests and tokens; a fleet is steered by
+// how many conversations each machine is holding NOW, which those totals cannot
+// say. `perClient` is that figure, off the same walk stats() already does.
+test('stats counts sessions per client, active and known apart', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+
+  st.beginRequest('s1', clock.t, { client: 'mbp' });
+  st.endRequest('s1', clock.t);
+  st.beginRequest('s2', clock.t, { client: 'mbp' });
+  st.endRequest('s2', clock.t);
+  st.beginRequest('s3', clock.t, { client: 'steamdeck' });
+  st.endRequest('s3', clock.t);
+
+  assert.deepEqual(st.stats(clock.t).perClient, {
+    mbp: { active: 2, known: 2 },
+    steamdeck: { active: 1, known: 1 },
+  });
+
+  // Past the active window, one of mbp's sessions speaks again: the other is
+  // still remembered but no longer running, which is the whole reason the two
+  // counts are reported separately.
+  clock.t += SESSION_ACTIVE_TTL_MS + 1;
+  st.beginRequest('s1', clock.t, { client: 'mbp' });
+  st.endRequest('s1', clock.t);
+
+  assert.deepEqual(st.stats(clock.t).perClient, {
+    mbp: { active: 1, known: 2 },
+    steamdeck: { active: 0, known: 1 },
+  });
+});
+
+// A session whose request carried no client label (the shared proxy.apiKey, or
+// loopback traffic exempt from the auth gate) appears in no Clients row either,
+// so counting it under some placeholder name would invent a client.
+test('stats leaves an unattributed session out of every per-client count', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+
+  st.beginRequest('named', clock.t, { client: 'mbp' });
+  st.endRequest('named', clock.t);
+  st.beginRequest('anonymous', clock.t);
+  st.endRequest('anonymous', clock.t);
+
+  const stats = st.stats(clock.t);
+  assert.deepEqual(stats.perClient, { mbp: { active: 1, known: 1 } });
+  assert.equal(stats.active, 2);   // still counted in the fleet totals
+  assert.equal(stats.known, 2);
+});

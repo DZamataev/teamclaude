@@ -474,7 +474,8 @@ export class SessionTracker {
     }
   }
 
-  // { known, active, perAccount: { [index]: activeCount }, perAccountBucket, tokens }
+  // { known, active, perAccount: { [index]: activeCount }, perAccountBucket,
+  //   perClient: { [client]: { active, known } }, tokens }
   // — for status/TUI. Sweeps as it goes so a long-lived headless server stays bounded.
   // The token totals come out of the walk this already does: the status endpoint
   // is read on every TUI frame, so nothing here may add a second pass.
@@ -502,6 +503,19 @@ export class SessionTracker {
     // carrying three Fable sessions are not the same picture, and `3 sess` on
     // both says they are.
     const perAccountBucket = {};
+    // { [client]: { active, known } } — the same walk, grouped by the label
+    // `beginRequest` attached. The Clients block reports requests and tokens,
+    // which are lifetime totals: they say a machine has been busy at some point,
+    // never how many conversations it is holding right now. Sessions are the
+    // figure a fleet is steered by, and the per-account counts alone cannot say
+    // which machine put them there.
+    //
+    // Keyed by the client name, which is operator config (proxy.clientKeys), so
+    // this map is bounded by the config file rather than by caller traffic —
+    // unlike the session ids it is summarising. An unattributed session (shared
+    // key, or loopback exempt from the gate) has no name and is counted in
+    // neither bucket, exactly as it appears in no Clients row.
+    const perClient = {};
     const tokens = emptyAggregate();
     const byBucket = {};
     const items = detail ? [] : null;
@@ -517,6 +531,13 @@ export class SessionTracker {
         continue;
       }
       known += 1;
+      // One entry per named client, created on the first session it holds so a
+      // client with none is absent rather than zeroed — the Clients block it
+      // annotates is itself only the clients that were seen.
+      const clientRow = s.client
+        ? (perClient[s.client] || (perClient[s.client] = { active: 0, known: 0 }))
+        : null;
+      if (clientRow) clientRow.known += 1;
       if (items) items.push(sessionItem(id, s, this._isActive(s, now)));
       for (const [bucket, t] of s.tokens) {
         const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
@@ -527,6 +548,7 @@ export class SessionTracker {
       }
       if (this._isActive(s, now)) {
         active += 1;
+        if (clientRow) clientRow.active += 1;
         if (s.starved > starvedMax) starvedMax = s.starved;
         // Once per account, on every account this session is currently
         // spending, so the per-account counts can sum to more than `active`.
@@ -553,7 +575,7 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
-    const base = { known, active, perAccount, perAccountBucket, tokens, starvedMax };
+    const base = { known, active, perAccount, perAccountBucket, perClient, tokens, starvedMax };
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
