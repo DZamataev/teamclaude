@@ -1,5 +1,6 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { safeLine } from './safe-text.js';
 import { ensureAccountIds } from './account-id.js';
 
 /**
@@ -111,6 +112,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    // Read per request like the two above (server.js rewriteRequestBody), and
+    // missing from this sync until #374: an edit waited for a restart.
+    mgr.stripRequestFields = diskAcct.stripRequestFields || null;
     mgr.messageThreads = diskAcct.messageThreads === true;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
@@ -121,6 +125,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
     }
@@ -136,7 +141,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         const creds = await importCredentials(diskAcct.importFrom);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
       } catch (/** @type {any} */ err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
+        console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
@@ -155,12 +160,12 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
+        console.log(`[TeamClaude] Refreshed credentials for "${safeLine(mgr.name, 64)}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }
   return added;
