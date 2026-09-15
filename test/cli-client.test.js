@@ -21,6 +21,14 @@ async function writeConfig({ port = 3, apiKey = 'shared-secret', clientKeys = []
   return path;
 }
 
+// A CLI that never exits must fail the test rather than hang it, but the
+// deadline has to cover the work the process legitimately does — including
+// waiting its turn behind the other updaters in the concurrency test below.
+// That queue takes one config write per process, and on a small single-core
+// host each turn is slow enough that a ten-second cap killed processes that
+// were working correctly.
+const CLI_TIMEOUT_MS = 120_000;
+
 function runCli(configPath, cliArgs) {
   const child = spawn(process.execPath, [cliPath, ...cliArgs], {
     env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
@@ -33,7 +41,7 @@ function runCli(configPath, cliArgs) {
   child.stdout.on('data', c => { stdout += c; });
   child.stderr.on('data', c => { stderr += c; });
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('CLI did not exit')); }, 10_000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('CLI did not exit')); }, CLI_TIMEOUT_MS);
     child.on('error', err => { clearTimeout(timer); reject(err); });
     child.on('exit', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
