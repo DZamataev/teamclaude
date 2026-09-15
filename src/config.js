@@ -182,25 +182,51 @@ export async function saveConfig(config) {
 // invalid_grant and need a re-login. Chaining the updates keeps every write.
 let configUpdateChain = Promise.resolve();
 
-// How long ONE holder may keep the lock before we call it stuck. This is not a
-// bound on total waiting time: a queue of N updaters legitimately takes N turns,
-// and measuring the whole wait against a fixed budget fails the callers at the
-// back of a queue that is working perfectly. The refresh path is the one that
-// matters — several OAuth accounts saving rotated tokens at once, on a machine
-// with one core — and failing there costs a re-login, exactly what the chaining
-// above exists to prevent. So the deadline is per holder, and any change of
-// holder is progress and restarts it.
-const CONFIG_LOCK_TIMEOUT_MS = 15_000;
+// A lock is stuck when its holder is GONE, not when it is slow. Time alone
+// cannot tell the two apart: on a small host a queue of updaters legitimately
+// takes one slow turn each, and every fixed budget — whether it bounds the
+// whole wait or a single turn — eventually fails callers that are waiting on
+// work which is actually progressing. The queue that matters is several OAuth
+// accounts persisting rotated refresh tokens at once, where a caller that gives
+// up loses a token upstream has already rotated and the account needs a
+// re-login: precisely what this locking exists to prevent.
+//
+// So the holder writes its pid, and a waiter only breaks the lock once that
+// process is gone. A live holder is waited on for as long as it lives.
 
-// Identity of the lock file we are waiting behind: a new holder means the queue
-// advanced. Inode and birth/modification time together, because a lock released
-// and re-taken in the same millisecond can reuse an inode.
-async function lockHolder(lockPath) {
+// The grace period before an ownerless lock is broken. A lock is written in two
+// steps — create, then write the pid — so a lock found empty may simply be one
+// created microseconds ago. Waiting this long before believing it is abandoned
+// costs nothing on the happy path and avoids stealing a lock from a holder that
+// had not finished announcing itself.
+const CONFIG_LOCK_STALE_MS = 15_000;
+
+// Is this process alive? Signal 0 performs the permission and existence checks
+// without delivering anything. EPERM means it exists under another uid, which
+// still answers the question that matters here: something holds this lock.
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    const info = await stat(lockPath);
-    return `${info.ino}:${info.mtimeMs}:${info.birthtimeMs}`;
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+// Who holds the lock: its pid, and how long the file has existed. A lock whose
+// contents are unreadable or not a pid is treated as ownerless, which the
+// caller resolves by the staleness rule rather than by trusting it forever.
+async function readLockHolder(lockPath) {
+  try {
+    const [text, info] = await Promise.all([
+      readFile(lockPath, 'utf-8').catch(() => ''),
+      stat(lockPath),
+    ]);
+    const pid = Number.parseInt(String(text).trim(), 10);
+    return { pid: Number.isInteger(pid) ? pid : null, ageMs: Date.now() - info.mtimeMs };
   } catch {
-    // Gone (or unreadable): the next open() attempt decides what that means.
+    // Gone: the next open() attempt is the one that decides what that means.
     return null;
   }
 }
@@ -208,25 +234,30 @@ async function lockHolder(lockPath) {
 async function acquireConfigLock() {
   const configPath = await realpath(getConfigPath()).catch(() => getConfigPath());
   const lockPath = `${configPath}.lock`;
-  let heldSince = Date.now();
-  let heldBy = null;
   while (true) {
     try {
       const handle = await open(lockPath, 'wx', 0o600);
+      // Announce ownership so a later waiter can tell a live holder from the
+      // remains of one that was killed.
+      await handle.write(`${process.pid}\n`, 0, 'utf-8').catch(() => {});
+      await handle.sync?.().catch(() => {});
       return async () => {
         await handle.close().catch(() => {});
         await unlink(lockPath).catch(() => {});
       };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      const holder = await lockHolder(lockPath);
-      // A holder we have not seen before: someone finished and someone else
-      // started, so the wait is progressing and this holder gets its own budget.
-      if (holder !== heldBy) {
-        heldBy = holder;
-        heldSince = Date.now();
-      } else if (Date.now() - heldSince >= CONFIG_LOCK_TIMEOUT_MS) {
-        throw new Error(`Timed out waiting for another TeamClaude process to update ${configPath}; if none is running, remove the stale lock ${lockPath}`);
+      const holder = await readLockHolder(lockPath);
+      // Released while we looked: retry immediately rather than sleeping.
+      if (holder) {
+        const ownerless = holder.pid == null || !processAlive(holder.pid);
+        if (ownerless && holder.ageMs >= CONFIG_LOCK_STALE_MS) {
+          // The holder is gone and left the lock behind. Remove it and race for
+          // it like everyone else; losing that race is fine, the winner is a
+          // live holder we will then wait on.
+          await unlink(lockPath).catch(() => {});
+          continue;
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 10 + Math.floor(Math.random() * 20)));
     }

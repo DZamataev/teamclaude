@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, writeFile, stat, chmod } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile, stat, chmod, unlink } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -149,20 +149,59 @@ test('a long but progressing queue of separate processes does not time out', asy
   });
 });
 
-// The other half of the same rule: a holder that never finishes must still be
-// called out, or one process killed mid-update would wedge every later one.
-test('a lock nobody releases is reported rather than waited on forever', async () => {
+// The other half of the same rule: a lock left behind by a process that died
+// mid-update must not wedge every later one. Since a live holder is now waited
+// on indefinitely, the thing that breaks the deadlock is noticing the owner is
+// gone — so the update must SUCCEED here, not merely fail in bounded time.
+test('a lock left by a dead process is broken, not waited on forever', async () => {
   await withConfigDir(async ({ cfg, path }) => {
     await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
-    // A lock file with no owner: what a process killed mid-update leaves.
-    await writeFile(`${path}.lock`, '');
+
+    // A real pid that is no longer running: a process spawned and reaped, which
+    // is exactly the corpse a killed updater leaves pointing out of its lock.
+    const corpse = spawn(process.execPath, ['--eval', '0'], { stdio: 'ignore' });
+    const deadPid = await new Promise(resolve => corpse.on('exit', () => resolve(corpse.pid)));
+    await writeFile(`${path}.lock`, `${deadPid}\n`);
 
     const started = Date.now();
-    await assert.rejects(
-      cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'never' }); }),
-      /Timed out waiting for another TeamClaude process/,
-    );
-    // Bounded by one holder's deadline, not by patience.
-    assert.ok(Date.now() - started < 60_000, `gave up within a bounded time, took ${Date.now() - started}ms`);
+    await cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'after-the-corpse' }); });
+    const saved = JSON.parse(await readFile(path, 'utf-8'));
+
+    assert.deepEqual(saved.accounts.map(a => a.name), ['after-the-corpse'], 'the update went through');
+    assert.ok(Date.now() - started < 60_000, `broke the stale lock promptly, took ${Date.now() - started}ms`);
+  });
+});
+
+// The dangerous mistake in the other direction: breaking a lock whose owner is
+// merely slow loses the very write the lock protects. A live holder must be
+// waited on however long it takes.
+test('a lock held by a live process is never stolen', async () => {
+  await withConfigDir(async ({ cfg, path }) => {
+    await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
+
+    // A process that is alive and doing nothing: its pid in the lock file means
+    // "someone is working", and no elapsed time may override that.
+    const holder = spawn(process.execPath, ['--eval', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
+    await writeFile(`${path}.lock`, `${holder.pid}\n`);
+
+    try {
+      const update = cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'stolen' }); });
+      const outcome = await Promise.race([
+        update.then(() => 'completed', err => `failed: ${err.message}`),
+        // Comfortably past any fixed budget the implementation might still hold.
+        new Promise(resolve => setTimeout(() => resolve('still waiting'), 20_000)),
+      ]);
+      assert.equal(outcome, 'still waiting', 'a live holder must not be overridden by elapsed time');
+
+      // Releasing the lock lets the waiter through, proving it was queued
+      // rather than wedged.
+      holder.kill('SIGKILL');
+      await new Promise(resolve => holder.on('exit', resolve));
+      await unlink(`${path}.lock`).catch(() => {});
+      await update;
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf-8')).accounts.map(a => a.name), ['stolen']);
+    } finally {
+      holder.kill('SIGKILL');
+    }
   });
 });
