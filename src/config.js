@@ -1,4 +1,4 @@
-import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
+import { readFile, open, mkdir, chmod, rename, unlink, realpath, stat } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -182,12 +182,34 @@ export async function saveConfig(config) {
 // invalid_grant and need a re-login. Chaining the updates keeps every write.
 let configUpdateChain = Promise.resolve();
 
+// How long ONE holder may keep the lock before we call it stuck. This is not a
+// bound on total waiting time: a queue of N updaters legitimately takes N turns,
+// and measuring the whole wait against a fixed budget fails the callers at the
+// back of a queue that is working perfectly. The refresh path is the one that
+// matters — several OAuth accounts saving rotated tokens at once, on a machine
+// with one core — and failing there costs a re-login, exactly what the chaining
+// above exists to prevent. So the deadline is per holder, and any change of
+// holder is progress and restarts it.
 const CONFIG_LOCK_TIMEOUT_MS = 15_000;
+
+// Identity of the lock file we are waiting behind: a new holder means the queue
+// advanced. Inode and birth/modification time together, because a lock released
+// and re-taken in the same millisecond can reuse an inode.
+async function lockHolder(lockPath) {
+  try {
+    const info = await stat(lockPath);
+    return `${info.ino}:${info.mtimeMs}:${info.birthtimeMs}`;
+  } catch {
+    // Gone (or unreadable): the next open() attempt decides what that means.
+    return null;
+  }
+}
 
 async function acquireConfigLock() {
   const configPath = await realpath(getConfigPath()).catch(() => getConfigPath());
   const lockPath = `${configPath}.lock`;
-  const started = Date.now();
+  let heldSince = Date.now();
+  let heldBy = null;
   while (true) {
     try {
       const handle = await open(lockPath, 'wx', 0o600);
@@ -197,7 +219,13 @@ async function acquireConfigLock() {
       };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      if (Date.now() - started >= CONFIG_LOCK_TIMEOUT_MS) {
+      const holder = await lockHolder(lockPath);
+      // A holder we have not seen before: someone finished and someone else
+      // started, so the wait is progressing and this holder gets its own budget.
+      if (holder !== heldBy) {
+        heldBy = holder;
+        heldSince = Date.now();
+      } else if (Date.now() - heldSince >= CONFIG_LOCK_TIMEOUT_MS) {
         throw new Error(`Timed out waiting for another TeamClaude process to update ${configPath}; if none is running, remove the stale lock ${lockPath}`);
       }
       await new Promise(resolve => setTimeout(resolve, 10 + Math.floor(Math.random() * 20)));

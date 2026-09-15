@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, writeFile, stat, chmod } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const configModuleUrl = new URL('../src/config.js', import.meta.url).href;
 
 // The config holds every account's OAuth tokens and the proxy key. A save that
 // truncates in place leaves nothing behind if the process dies mid-write; a
@@ -87,5 +90,79 @@ test('saveConfig follows a symlinked config to its target instead of replacing t
     assert.ok((await lstat(path)).isSymbolicLink(), 'the config path is still a symlink');
     assert.deepEqual(JSON.parse(await readFile(real, 'utf-8')).proxy.port, 2, 'the link target received the write');
     assert.deepEqual((await readdir(dir)).sort(), ['real.json', 'teamclaude.json']);
+  });
+});
+
+// The lock deadline exists to break a STUCK holder — a process that died
+// holding the file, or one wedged mid-write. It is not a budget for the whole
+// wait: N processes updating the config take N turns by construction, and a
+// slow machine makes each turn long. Measuring the TOTAL wait against a fixed
+// deadline fails the processes at the back of a queue that is working
+// perfectly, and the queue that matters is several OAuth accounts persisting
+// rotated refresh tokens at once — a caller that gives up there loses a token
+// that was already rotated away, which costs a re-login.
+//
+// This has to be driven by real processes: within one process the update chain
+// serializes callers before the file lock is ever contended, so an in-process
+// version of this test passes against either rule and proves nothing.
+function spawnUpdater(configPath, name, holdMs) {
+  const source = `
+    import { atomicConfigUpdate } from ${JSON.stringify(configModuleUrl)};
+    await atomicConfigUpdate(async config => {
+      config.accounts.push({ name: ${JSON.stringify(name)} });
+      await new Promise(r => setTimeout(r, ${holdMs}));
+    });
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', c => { stderr += c; });
+  return new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', code => resolve({ code, stderr }));
+  });
+}
+
+test('a long but progressing queue of separate processes does not time out', async () => {
+  await withConfigDir(async ({ cfg, path }) => {
+    await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
+
+    // Each holder keeps the lock for a good fraction of the deadline, so the
+    // whole queue outlasts what any single holder is allowed — the shape a
+    // total-wait deadline fails on however fast the machine is.
+    const HOLD_MS = 3_000;
+    const TURNS = 8;
+    const results = await Promise.all(
+      Array.from({ length: TURNS }, (_, i) => spawnUpdater(path, `acct-${i}`, HOLD_MS)),
+    );
+
+    for (const r of results) assert.equal(r.code, 0, r.stderr);
+    const saved = JSON.parse(await readFile(path, 'utf-8'));
+    assert.deepEqual(
+      new Set(saved.accounts.map(a => a.name)),
+      new Set(Array.from({ length: TURNS }, (_, i) => `acct-${i}`)),
+      'every process persisted its update',
+    );
+  });
+});
+
+// The other half of the same rule: a holder that never finishes must still be
+// called out, or one process killed mid-update would wedge every later one.
+test('a lock nobody releases is reported rather than waited on forever', async () => {
+  await withConfigDir(async ({ cfg, path }) => {
+    await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
+    // A lock file with no owner: what a process killed mid-update leaves.
+    await writeFile(`${path}.lock`, '');
+
+    const started = Date.now();
+    await assert.rejects(
+      cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'never' }); }),
+      /Timed out waiting for another TeamClaude process/,
+    );
+    // Bounded by one holder's deadline, not by patience.
+    assert.ok(Date.now() - started < 60_000, `gave up within a bounded time, took ${Date.now() - started}ms`);
   });
 });
