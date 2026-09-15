@@ -451,3 +451,54 @@ test('operations other than status explain how to install when metadata is absen
   ]) await assert.rejects(operation(), /teamclaude deploy install <git-url>/i);
   assert.deepEqual(fx.calls, []);
 });
+
+// The real runCandidateTests: every other case here replaces it wholesale, so
+// the command a deploy actually issues is otherwise never asserted. A deploy
+// verifies a release ON the machine it is deploying to, which in this project's
+// own fleet is a 1GB single-core VPS running the live proxy.
+function candidateTestRuns(overrides = {}) {
+  const fx = fixture();
+  const runs = [];
+  fx.dependencies.readDeployment = async () => deploymentMetadata(fx.layout);
+  // Keep the real implementation; capture what it asks the machine to do.
+  delete fx.dependencies.runCandidateTests;
+  fx.dependencies.run = (command, argv, options) => {
+    runs.push({ command, argv, options });
+    return { code: 0, stdout: '', stderr: '', ...overrides };
+  };
+  return { fx, runs };
+}
+
+test('candidate tests run serially, with a budget for the whole suite', async () => {
+  const { fx, runs } = candidateTestRuns();
+
+  await createDeployManager(fx.dependencies).deployRef({ ref: 'master' });
+
+  const testRun = runs.find(r => r.argv.includes('--test'));
+  assert.ok(testRun, `no test run issued: ${JSON.stringify(runs.map(r => r.argv))}`);
+  // One worker per core is node's default, and each worker is a whole node
+  // process. On a small host that overcommits memory and the OOM killer starts
+  // picking victims — the teamclaude service among them, which is precisely the
+  // thing this deploy is supposed to be updating safely.
+  assert.ok(
+    testRun.argv.includes('--test-concurrency=1'),
+    `serial run not requested: ${testRun.argv.join(' ')}`,
+  );
+  // The budget covers the whole suite. Sized from one test's timeout it kills
+  // the runner part way through a suite that is merely long, which surfaces as
+  // a pile of failing files rather than as the timeout it actually is.
+  assert.ok(
+    testRun.options.timeoutMs >= 10 * 60_000,
+    `suite budget too small to be a suite budget: ${testRun.options.timeoutMs}ms`,
+  );
+});
+
+test('a failing candidate suite refuses the release', async () => {
+  const { fx } = candidateTestRuns({ code: 1 });
+
+  await assert.rejects(
+    createDeployManager(fx.dependencies).deployRef({ ref: 'master' }),
+    /candidate tests exited 1/,
+  );
+  assert.equal(fx.calls.includes('activateCandidate'), false);
+});
