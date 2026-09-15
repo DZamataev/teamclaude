@@ -736,6 +736,16 @@ export class TUI {
       enter: () => this._cycleEventLogging(+1),
     });
 
+    fields.push({
+      id: 'clientMode',
+      label: 'Client mode',
+      hint: '←→ toggle',
+      value: () => (this.config.defaultClientMode === 'base-url' ? yellow('base-url') : green('mitm')),
+      left: () => this._toggleClientMode(),
+      right: () => this._toggleClientMode(),
+      enter: () => this._toggleClientMode(),
+    });
+
     if (this.sessionTitles) {
       fields.push({
         id: 'sessionTitles',
@@ -1199,6 +1209,19 @@ export class TUI {
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(`Event logging: ${next}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleClientMode() {
+    // What `teamclaude run` and `env` do when no --mitm/--no-mitm flag is given.
+    // Base-URL keeps a shell's other tools off the proxy (#382); MITM covers the
+    // hard-coded endpoints and the Codex CLI. Read from disk by those commands,
+    // so the save is the whole application.
+    const next = this.config.defaultClientMode === 'base-url' ? 'mitm' : 'base-url';
+    this.config.defaultClientMode = next;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Default client mode: ${next} (run/env without a flag)`);
     if (this.running) this.render();
   }
 
@@ -1846,6 +1869,10 @@ export class TUI {
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
     lines.push(row(byId('eventlog')));
     if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
+    lines.push('');
+    // ── Launch
+    lines.push(bold('  Launch') + dim('  — how `teamclaude run` and `env` reach the proxy when no flag says'));
+    lines.push(row(byId('clientMode')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
