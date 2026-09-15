@@ -25,7 +25,11 @@ function captureLog(fn) {
 
 test('an unparseable 5h reset is ignored, so the bucket still clears on the reset we knew', () => {
   const am = new AccountManager([oauth('a')], 0.98);
-  const past = Math.floor((Date.now() + 1000) / 1000); // a reset just ahead of us
+  // Far enough ahead that a loaded machine cannot cross it between the store
+  // and the assertions below: reading the quota clears a window whose reset has
+  // passed, so a one-second margin made this test fail on a busy host for the
+  // very behaviour it is checking is preserved.
+  const past = Math.floor((Date.now() + 60_000) / 1000); // a reset comfortably ahead of us
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-5h-utilization': '1',
     'anthropic-ratelimit-unified-5h-reset': String(past),
