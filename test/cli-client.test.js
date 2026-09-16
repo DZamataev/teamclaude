@@ -4,8 +4,9 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 import http from 'node:http';
+import { fileURLToPath } from 'node:url';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
@@ -157,6 +158,38 @@ test('client remove refuses a key that is still accepted as proxy.apiKey', async
   assert.equal(await readFile(configPath, 'utf8'), before);
 });
 
+// The same lie one step further out: two clients issued the same key (a copied
+// credential, or two machines an operator set up alike). Removing one leaves
+// the key working under the other name, so "Removed 1 key" would tell an
+// operator a credential is withdrawn while it still authenticates.
+test('client remove refuses a key another client still holds', async () => {
+  const configPath = await writeConfig({ clientKeys: [
+    { name: 'laptop', key: 'shared-between-two' },
+    { name: 'desktop', key: 'shared-between-two' },
+    { name: 'other', key: 'its-own-key' },
+  ] });
+  const before = await readFile(configPath, 'utf8');
+  const res = await runCli(configPath, ['client', 'remove', 'laptop']);
+
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /shares its key with "desktop"/);
+  assert.match(res.stderr, /would remain valid/i);
+  assert.equal(await readFile(configPath, 'utf8'), before, 'the config is untouched');
+});
+
+// The ordinary case must keep working: a client with its own key is removed
+// even while other clients exist.
+test('client remove still revokes a key no one else holds', async () => {
+  const configPath = await writeConfig({ clientKeys: [
+    { name: 'laptop', key: 'laptop-only' },
+    { name: 'desktop', key: 'desktop-only' },
+  ] });
+  const res = await runCli(configPath, ['client', 'remove', 'laptop']);
+
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual((await readProxy(configPath)).clientKeys, [{ name: 'desktop', key: 'desktop-only' }]);
+});
+
 test('client add reloads a running server with the shared proxy key', async t => {
   let seen = null;
   const server = http.createServer((req, res) => {
@@ -242,4 +275,45 @@ test('top-level help documents client key management', async () => {
   const res = await runCli(configPath, ['help']);
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /client <sub>\s+Manage per-client proxy keys: add \| list \| remove/);
+});
+
+// A config that lists clients whose entries are unusable — an empty key, a
+// blank name — is not the same as a config that lists none. The server ignores
+// both, but an operator reading "No client keys configured" over a file that
+// visibly names clients goes looking in the wrong place.
+test('client list distinguishes no entries from no USABLE entries', async () => {
+  const empty = await writeConfig({ clientKeys: [] });
+  const emptyRes = await runCli(empty, ['client', 'list']);
+  assert.equal(emptyRes.code, 0, emptyRes.stderr);
+  assert.match(emptyRes.stdout, /No client keys configured\./);
+
+  const malformed = await writeConfig({ clientKeys: [
+    { name: 'alice', key: '' },
+    { name: '   ', key: 'orphaned-key' },
+  ] });
+  const malformedRes = await runCli(malformed, ['client', 'list']);
+  assert.equal(malformedRes.code, 0, malformedRes.stderr);
+  assert.match(malformedRes.stdout, /No usable client keys configured \(2 malformed entries ignored\)\./);
+});
+
+// A listener that accepts the TCP connection and then never answers — a wedged
+// server, or a stale port some other process now holds. Without a deadline on
+// the reload the credential command hangs forever, with the key already on
+// disk and the operator unable to tell whether the running server has it.
+test('a mutation does not hang when the reload endpoint never answers', async () => {
+  const silent = net.createServer(socket => { socket.resume(); /* never reply */ });
+  await new Promise(resolve => silent.listen(0, '127.0.0.1', resolve));
+  const port = silent.address().port;
+
+  try {
+    const configPath = await writeConfig({ port });
+    const started = Date.now();
+    const res = await runCli(configPath, ['client', 'add', 'wedged']);
+    const took = Date.now() - started;
+
+    assert.equal(res.code, 1, 'a reload that never answers fails the command');
+    assert.ok(took < 30_000, `gave up rather than hanging (took ${took}ms)`);
+  } finally {
+    await new Promise(resolve => silent.close(resolve));
+  }
 });
