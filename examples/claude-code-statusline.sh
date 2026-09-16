@@ -86,7 +86,17 @@ cache_dir=${cache_file%/*}
 [ "$cache_dir" = "$cache_file" ] || mkdir -p "$cache_dir" 2>/dev/null || exit 0
 
 now=$(date +%s)
-cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || printf 0)
+# GNU stat first, and both forms must have their OUTPUT discarded on failure,
+# not just their stderr. `stat -f` means "file system" to GNU and "format" to
+# BSD: on Linux `stat -f %m` prints a block of filesystem information and exits
+# 0, so an `||` chain never reaches the GNU form and the age arithmetic below is
+# handed that block instead of a timestamp. Anything that is not a plain integer
+# becomes 0, which reads as "cache from 1970" — stale, so the script refreshes
+# rather than trusting a value it could not parse.
+cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || true)
+case "$cache_mtime" in
+    ''|*[!0-9]*) cache_mtime=0 ;;
+esac
 quota_file=''
 if [ -f "$cache_file" ] && [ $((now - cache_mtime)) -lt 15 ]; then
     quota_file="$cache_file"

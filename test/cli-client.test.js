@@ -248,7 +248,14 @@ test('client mutation reports a running server reload failure', async t => {
 
 test('concurrent client adds preserve every successful mutation', async () => {
   const configPath = await writeConfig();
-  const names = Array.from({ length: 12 }, (_, i) => `client-${i}`);
+  // Enough writers to contend for the lock several times over, few enough to
+  // fit on the machine under test. Each one is a whole Node process (~70MB),
+  // so twelve at once plus the test runner exceeds a 1GB host with no swap:
+  // they then crawl against each other and the harness kills them at its
+  // deadline, which reads as "the CLI hung" rather than "the box ran out".
+  // Four still proves the property — a queue that must be waited out — and
+  // leaves the same evidence in a fraction of the footprint.
+  const names = Array.from({ length: 4 }, (_, i) => `client-${i}`);
   const results = await Promise.all(names.map(name => runCli(configPath, ['client', 'add', name])));
 
   for (const result of results) assert.equal(result.code, 0, result.stderr);
