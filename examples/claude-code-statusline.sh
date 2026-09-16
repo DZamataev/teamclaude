@@ -106,6 +106,15 @@ else
         quota_file="$cache_file"
     else
         rm -f "$temp_file"
+        # The refresh failed: the proxy is down, the network is away, or the
+        # reply was unusable. A reading from minutes ago is still worth more
+        # than a blank status line — quota moves slowly, and a line that simply
+        # disappears reads as "no quota to show" rather than "could not ask".
+        # Only a cache that parses is accepted, so a truncated file cannot be
+        # promoted here.
+        if [ -f "$cache_file" ] && jq -e '.aggregate | type == "object"' "$cache_file" >/dev/null 2>&1; then
+            quota_file="$cache_file"
+        fi
     fi
 fi
 
@@ -133,6 +142,12 @@ while IFS= read -r account; do
         else .name
         end
     ' <<<"$account" 2>/dev/null)
+    # An account label comes from an OAuth profile or the config file, and is
+    # about to be printed to a terminal through %b, which expands backslash
+    # escapes as well. Strip C0/C1 controls, backslashes and DEL, and bound the
+    # length — the Node status renderer does the same with safeLine(), and
+    # without it a name carrying \033[2J clears the operator's screen.
+    label=$(printf '%s' "$label" | LC_ALL=C tr -d '\000-\037\177-\237\\' | cut -c1-64)
     account_five=$(jq -r '.buckets.fiveHour.remaining // empty' <<<"$account" 2>/dev/null)
     account_five_reset=$(jq -r '.buckets.fiveHour.resetAt // empty' <<<"$account" 2>/dev/null)
     account_weekly=$(jq -r '.buckets.weeklyShared.remaining // empty' <<<"$account" 2>/dev/null)
@@ -161,4 +176,8 @@ done < <(jq -c '.accounts[]? | select(.disabled != true)' "$quota_file" 2>/dev/n
 if [ -n "$aggregate_output" ]; then
     printf '%bΣ%b %b left\n' "$CYAN" "$RESET" "$aggregate_output"
     [ -n "$accounts_output" ] && printf '  %b\n' "$accounts_output"
+    # `&&` above must not become this script's exit status: a valid payload
+    # whose accounts are all disabled would otherwise exit 1 on a line that
+    # printed exactly what it meant to.
+    true
 fi
