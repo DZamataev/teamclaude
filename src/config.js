@@ -242,8 +242,15 @@ async function acquireConfigLock(lockPath) {
       }
     }
     if (lockIsStale(lockPath)) {
-      await unlink(lockPath).catch(() => {});
-      continue;
+      // A failed unlink must not spin. `continue` skips the poll below, so a
+      // lock we judge stale but cannot remove — EPERM, a read-only mount, an
+      // ACL, an NFS error — turned this into a busy loop that never yields and
+      // never reports anything, with the caller hanging forever on a save. Only
+      // retry immediately when the removal actually happened; otherwise fall
+      // through to the poll and the same-holder escape below, so the write
+      // eventually proceeds with a warning instead of never returning.
+      const removed = await unlink(lockPath).then(() => true, () => false);
+      if (removed) continue;
     }
     const holder = lockHolder(lockPath);
     if (holder !== heldBy) {
