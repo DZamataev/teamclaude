@@ -5,6 +5,9 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// The staleness window from src/config.js's lock protocol.
+const LOCK_STALE_MS = 10_000;
+
 const configModuleUrl = new URL('../src/config.js', import.meta.url).href;
 
 // The config holds every account's OAuth tokens and the proxy key. A save that
@@ -168,18 +171,30 @@ test('a lock left by a dead process is broken, not waited on forever', async () 
 
     const started = Date.now();
     await cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'after-the-corpse' }); });
+    const waited = Date.now() - started;
     const saved = JSON.parse(await readFile(path, 'utf-8'));
 
     assert.deepEqual(saved.accounts.map(a => a.name), ['after-the-corpse'], 'the update went through');
-    assert.ok(Date.now() - started < 60_000, `broke the stale lock promptly, took ${Date.now() - started}ms`);
+    // Promptly means BY LIVENESS, not by outliving the staleness window. A
+    // budget loose enough to admit the age path (`< 60s`) passes with dead-PID
+    // detection disabled entirely, which is no proof at all — the timestamp
+    // expiry would have cleared it anyway. Half the window is the assertion
+    // that can only hold if the corpse was recognised as one.
+    assert.ok(waited < LOCK_STALE_MS / 2, `cleared by liveness, not by expiry (waited ${waited}ms)`);
   });
 });
 
 // The dangerous mistake in the other direction: breaking a lock whose owner is
 // merely slow loses the very write the lock protects. A live holder is waited
-// on for as long as it keeps its turn inside the staleness window — elapsed
-// time alone never overrides a pid that is still running.
-test('a lock held by a live process is never stolen', async () => {
+// on for its whole turn inside the staleness window, rather than for a flat
+// couple of seconds.
+//
+// Inside that window only. Past LOCK_STALE_MS the age rule takes the lock from
+// a holder that is still running — upstream's behaviour, unchanged here — so a
+// critical section slower than the window can still lose its write. That is a
+// property of the protocol, not of this change, and the name below says
+// "inside the window" rather than "never" because of it.
+test('a live holder is waited on for its turn, not cut off after a flat budget', async () => {
   await withConfigDir(async ({ cfg, path }) => {
     await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
 
