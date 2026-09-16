@@ -5,7 +5,7 @@ import { safeLine } from './safe-text.js';
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 
-export function renderStatus(status, { color = process.stdout.isTTY, now = Date.now() } = {}) {
+export function renderStatus(status, { color = process.stdout.isTTY, now = Date.now(), maxClients = Infinity } = {}) {
   const paint = colors(color);
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
@@ -79,7 +79,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const clients = Object.entries(status.clients || {});
   if (clients.length) {
     lines.push(paint.bold('Clients'));
-    renderUsageEntries(lines, clients, paint, now, status.sessions?.perClient);
+    renderUsageEntries(lines, clients, paint, now, maxClients, status.sessions?.perClient);
     lines.push('');
   }
 
@@ -100,18 +100,20 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 // A name-sized field, fit to print: an account or route name, a glob, a pin.
 const nameText = value => safeLine(value, 64);
 
-function renderUsageEntries(lines, entries, paint, now, perClient = null) {
+function renderUsageEntries(lines, entries, paint, now, limit = Infinity, perClient = null) {
   // Tokens are a lifetime total, so on their own they rank a machine that was
-  // busy yesterday above one holding three conversations right now. Live
-  // sessions come first, and tokens break the tie among clients that hold none
-  // — which is every client when session counts are absent, leaving the
-  // previous ordering byte-identical.
+  // busy yesterday above one holding three conversations right now. Where the
+  // list is CAPPED (watch's top five) that is not a matter of order but of
+  // visibility: the client the operator is watching can fall off the bottom.
+  // So live sessions come first, and tokens break the tie among clients that
+  // hold none — which is every client when session counts are absent, leaving
+  // the previous ordering byte-identical.
   entries.sort(([an, a], [bn, b]) => {
     const activeDiff = clientActiveSessions(perClient, bn) - clientActiveSessions(perClient, an);
     if (activeDiff) return activeDiff;
     return ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0));
   });
-  for (const [name, c] of entries) {
+  for (const [name, c] of entries.slice(0, limit)) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
     const last = parseTs(c.lastUsed);
     const lastText = last ? `, last ${formatAgo(last, now)}` : '';

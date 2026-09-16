@@ -218,6 +218,36 @@ test('the dashboard frame includes Anthropic health and colored TeamClaude quota
   assert.match(frame || '', /\x1b\[38;2;\d+;\d+;\d+m█/);
 });
 
+test('the dashboard shows only the five clients with the highest total token usage', () => {
+  const frame = dashboard.renderWatchFrame?.({
+    now: Date.parse('2026-09-03T13:00:00Z'),
+    anthropicStatus: 'Anthropic: OPERATIONAL',
+    teamClaudeStatus: {
+      currentAccount: null,
+      switchThreshold: 0.95,
+      probe: { enabled: false, intervalSeconds: 0, accounts: [] },
+      accounts: [],
+      clients: {
+        sixth: { requests: 99, inputTokens: 1, outputTokens: 1 },
+        third: { requests: 13, inputTokens: 300, outputTokens: 30 },
+        first: { requests: 17, inputTokens: 100, outputTokens: 500 },
+        fifth: { requests: 11, inputTokens: 100, outputTokens: 10 },
+        second: { requests: 15, inputTokens: 400, outputTokens: 40 },
+        fourth: { requests: 12, inputTokens: 200, outputTokens: 20 },
+      },
+    },
+  });
+  const output = (frame || '').replace(/\x1b\[[0-9;]*m/g, '');
+
+  const names = ['first', 'second', 'third', 'fourth', 'fifth'];
+  for (const name of names) assert.match(output, new RegExp(`\\b${name}\\b`));
+  for (let i = 1; i < names.length; i++) {
+    assert.ok(output.indexOf(names[i - 1]) < output.indexOf(names[i]), `${names[i - 1]} precedes ${names[i]}`);
+  }
+  assert.doesNotMatch(output, /\bsixth\b/);
+  assert.match(output, /first\s+17 req, 100 in \/ 500 out/);
+});
+
 test('the dashboard repaints complete frames in place and restores the cursor', async () => {
   const controller = new AbortController();
   const writes = [];
