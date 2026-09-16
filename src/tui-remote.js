@@ -3,6 +3,7 @@ import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
+import { timeoutSignal } from './abort.js';
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -44,8 +45,8 @@ export class RemoteControl {
   }
 
   /** The current status payload (the same one `teamclaude status` renders). */
-  async status() {
-    const payload = await this._call('GET', '/teamclaude/status');
+  async status({ signal = null } = {}) {
+    const payload = await this._call('GET', '/teamclaude/status', undefined, signal);
     // A status reply always carries an accounts array, even when it is empty.
     // Anything else answered on this port is not this control plane, and calling
     // that "connected with no accounts" would diagnose the wrong problem.
@@ -96,7 +97,7 @@ export class RemoteControl {
     return payload;
   }
 
-  async _call(method, path, body) {
+  async _call(method, path, body, signal = null) {
     const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     /** @type {Record<string, string>} */
     const headers = {};
@@ -104,6 +105,10 @@ export class RemoteControl {
     if (body !== undefined) headers['content-type'] = 'application/json';
 
     let res;
+    // `timeoutSignal` rather than a bare `AbortSignal.timeout`: the watch
+    // dashboard passes its own signal so a frame in flight is dropped when the
+    // dashboard exits, and `cleanup()` releases the timer either way.
+    const request = timeoutSignal(signal, deadline);
     try {
       res = await this._fetch(`http://${this.host}:${this.port}${path}`, {
         method, headers,
@@ -111,13 +116,15 @@ export class RemoteControl {
         // A socket that is open but silent — the server stopped, the laptop
         // suspended mid-request — would otherwise hold this call for minutes
         // while the dashboard showed a live marker over a frozen snapshot.
-        signal: AbortSignal.timeout(deadline),
+        signal: request.signal,
       });
     } catch (err) {
       if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
         throw new Error(`no reply within ${deadline}ms`);
       }
       throw err;
+    } finally {
+      request.cleanup();
     }
     const raw = await readReply(res);
     let payload = null;
