@@ -2705,6 +2705,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    // A host-scoped failure (DNS, host unreachable) is about the HOST, not the
+    // account, so every untried account pointing at that same host would fail
+    // the same way. Mark them tried in one go rather than dialling a dead name
+    // once per account — otherwise a fleet sharing one broken upstream spends a
+    // full DNS timeout per sibling before reaching the account that can serve.
+    if (otherHostAvailable && errorCodes(err).some(code => HOST_TRANSIENT.has(code))) {
+      for (const candidate of accountManager.accounts) {
+        if (hostOf(candidate.upstream || upstream) === thisHost) ctx.tried.add(candidate.index);
+      }
+    }
+
     // Any other thrown error is a transport/stream failure, NOT proof the
     // account's credentials are bad — a bad credential comes back as a 401
     // *response*, never a throw. So don't sideline the account (that would drop
