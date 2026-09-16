@@ -130,10 +130,11 @@ test('a long but progressing queue of separate processes does not time out', asy
   await withConfigDir(async ({ cfg, path }) => {
     await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
 
-    // Each holder keeps the lock for a good fraction of the deadline, so the
-    // whole queue outlasts what any single holder is allowed — the shape a
-    // total-wait deadline fails on however fast the machine is.
-    const HOLD_MS = 3_000;
+    // Each holder keeps the lock for a good fraction of the staleness window
+    // without reaching it, so the queue as a whole runs several times longer
+    // than any fixed total-wait cap — the shape such a cap fails on however
+    // fast the machine is — while no individual holder is ever stale.
+    const HOLD_MS = 1_500;
     const TURNS = 8;
     const results = await Promise.all(
       Array.from({ length: TURNS }, (_, i) => spawnUpdater(path, `acct-${i}`, HOLD_MS)),
@@ -159,9 +160,11 @@ test('a lock left by a dead process is broken, not waited on forever', async () 
 
     // A real pid that is no longer running: a process spawned and reaped, which
     // is exactly the corpse a killed updater leaves pointing out of its lock.
+    // Written in the lock file's documented shape so the reader takes the pid
+    // path rather than falling back to the file's age.
     const corpse = spawn(process.execPath, ['--eval', '0'], { stdio: 'ignore' });
     const deadPid = await new Promise(resolve => corpse.on('exit', () => resolve(corpse.pid)));
-    await writeFile(`${path}.lock`, `${deadPid}\n`);
+    await writeFile(`${path}.lock`, JSON.stringify({ pid: deadPid, at: Date.now() }));
 
     const started = Date.now();
     await cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'after-the-corpse' }); });
@@ -173,23 +176,25 @@ test('a lock left by a dead process is broken, not waited on forever', async () 
 });
 
 // The dangerous mistake in the other direction: breaking a lock whose owner is
-// merely slow loses the very write the lock protects. A live holder must be
-// waited on however long it takes.
+// merely slow loses the very write the lock protects. A live holder is waited
+// on for as long as it keeps its turn inside the staleness window — elapsed
+// time alone never overrides a pid that is still running.
 test('a lock held by a live process is never stolen', async () => {
   await withConfigDir(async ({ cfg, path }) => {
     await cfg.saveConfig({ proxy: { port: 1 }, accounts: [] });
 
-    // A process that is alive and doing nothing: its pid in the lock file means
-    // "someone is working", and no elapsed time may override that.
+    // A process that is alive and doing nothing, announced in the lock file's
+    // documented shape: `{"pid":…,"at":…}`. That means "someone is working".
     const holder = spawn(process.execPath, ['--eval', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
-    await writeFile(`${path}.lock`, `${holder.pid}\n`);
+    await writeFile(`${path}.lock`, JSON.stringify({ pid: holder.pid, at: Date.now() }));
 
     try {
       const update = cfg.atomicConfigUpdate(config => { config.accounts.push({ name: 'stolen' }); });
       const outcome = await Promise.race([
         update.then(() => 'completed', err => `failed: ${err.message}`),
-        // Comfortably past any fixed budget the implementation might still hold.
-        new Promise(resolve => setTimeout(() => resolve('still waiting'), 20_000)),
+        // Well past the 2s total-wait cap this replaced, and inside the
+        // staleness window, where a live holder is simply waited on.
+        new Promise(resolve => setTimeout(() => resolve('still waiting'), 5_000)),
       ]);
       assert.equal(outcome, 'still waiting', 'a live holder must not be overridden by elapsed time');
 

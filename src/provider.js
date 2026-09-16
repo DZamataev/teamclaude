@@ -13,6 +13,8 @@
 // re-serialising tool calls, streaming events and cache breakpoints, which is
 // exactly the fidelity loss this proxy exists to avoid.
 
+import { classificationPath } from './classification-path.js';
+
 /** Providers keyed by the value used in an account's `provider` field. */
 export const PROVIDERS = {
   anthropic: {
@@ -43,6 +45,9 @@ export const DEFAULT_PROVIDER = 'anthropic';
  * The provider an account belongs to. Accounts written before providers
  * existed have no `provider` field and are Anthropic, so the default keeps
  * every existing config working untouched.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {keyof typeof PROVIDERS}
  */
 export function providerOf(account) {
   const id = account?.provider;
@@ -137,7 +142,14 @@ const CODEX_PATHS = ['/backend-api/codex'];
  * client-supplied hint that could disagree with the body.
  */
 export function providerForPath(url) {
-  const path = String(url || '').split('?')[0];
+  // Read on the classification path, never rewritten: the request goes out with
+  // the path exactly as it arrived, so this test has to read it the way the
+  // parser and the receiving server will. Otherwise
+  // `/backend-api/codex/..%2fconversations` classifies as Codex and lands
+  // somewhere else entirely, and `/backend-api\codex/responses` — which
+  // `new URL()` folds to a Codex path before sending it — does not classify as
+  // Codex at all, so it draws the wrong pool's credential.
+  const path = classificationPath(url);
   return CODEX_PATHS.some(p => path === p || path.startsWith(`${p}/`))
     ? 'codex'
     : DEFAULT_PROVIDER;
@@ -189,4 +201,26 @@ export function upstreamFor(account, configuredUpstream) {
 /** Whether the Anthropic-only body rewrites apply to this account. */
 export function rewritesBody(account) {
   return PROVIDERS[providerOf(account)].rewritesBody;
+}
+
+/** Whether `account` is served by a process on this machine rather than by a
+ *  vendor endpoint — typically a local translating proxy in front of another
+ *  backend.
+ *
+ *  Keyed on the upstream resolving to loopback. Pairing the account against a
+ *  declared local process does not generalise: such a declaration carries a
+ *  COMMAND rather than a port, and the port sits inside its argv, where every
+ *  program spells it differently. A loopback upstream says the same thing
+ *  directly, and says it for a hand-started process too. A remote third-party
+ *  backend (DeepSeek, GLM) keeps a public host and is not caught.
+ *
+ * @param {any} account
+ */
+export function isLocalUpstream(account) {
+  if (!account?.upstream) return false;
+  let hostname;
+  try { hostname = new URL(account.upstream).hostname; }
+  catch { return false; } // not a URL we can judge — treat it as a normal account
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase(); // URL brackets IPv6
+  return host === 'localhost' || host === '::1' || /^127\./.test(host);
 }

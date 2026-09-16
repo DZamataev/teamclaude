@@ -1,4 +1,5 @@
-import { readFile, open, mkdir, chmod, rename, unlink, realpath, stat } from 'node:fs/promises';
+import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
+import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -99,6 +100,7 @@ export function createDefaultConfig() {
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
     eventLogging: 'hide',
+    defaultClientMode: 'mitm',
     blockedModels: [],
     accounts: [],
   };
@@ -167,123 +169,145 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
-export async function saveConfig(config) {
-  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
-  // for why this is not a plain writeFile.
-  await writeJsonAtomic(getConfigPath(), config);
-}
-
-// Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
-// concurrent callers can both read the same config and then save in turn, and
-// the later save silently drops the earlier caller's change. This bites hardest
-// on startup, when several OAuth accounts refresh their tokens at once: only the
-// last writer's rotated refresh token persists, and the other accounts keep a
-// token that was just rotated away, so they fail on the next restart with
-// invalid_grant and need a re-login. Chaining the updates keeps every write.
-let configUpdateChain = Promise.resolve();
-
-// A lock is stuck when its holder is GONE, not when it is slow. Time alone
-// cannot tell the two apart: on a small host a queue of updaters legitimately
-// takes one slow turn each, and every fixed budget — whether it bounds the
-// whole wait or a single turn — eventually fails callers that are waiting on
-// work which is actually progressing. The queue that matters is several OAuth
-// accounts persisting rotated refresh tokens at once, where a caller that gives
-// up loses a token upstream has already rotated and the account needs a
-// re-login: precisely what this locking exists to prevent.
+// Every writer of the config — the server rotating a refresh token, a CLI
+// command, a GUI client — does its own read-modify-write with a temp+rename.
+// Two of them racing keep only the later write, and the edit that is lost is
+// as likely as not a freshly rotated refresh token, which costs a re-login.
+// The lock below is the coordination point. It is advisory and file-based so
+// that clients outside this package can honour it with no shared code:
 //
-// So the holder writes its pid, and a waiter only breaks the lock once that
-// process is gone. A live holder is waited on for as long as it lives.
+//   path     <configPath>.lock
+//   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
+//   stale    the pid no longer alive, or `at` older than 10 s: unlink and retry
+//   busy     poll every 25 ms while the holder is alive and turns keep changing
+//   release  unlink
+//
+// A writer must never hang on a lock, so a holder that neither finishes nor
+// goes stale is abandoned after twice the staleness window and the config is
+// written without the lock, with one warning line.
+//
+// The 2 s cap that used to live here bounded the WHOLE wait, which is the one
+// shape it must not: N writers of one file take N turns by construction, so a
+// queue that is working perfectly pushes the writers at the back past any fixed
+// total. Measured on a queue of eight short holders, seven updates were silently
+// dropped — the lost rotated token this lock exists to prevent, now with a
+// warning line attached. The budget is therefore per HOLDER: a live holder is
+// waited on, and any change of holder is progress.
+const LOCK_STALE_MS = 10_000;
+const LOCK_POLL_MS = 25;
 
-// The grace period before an ownerless lock is broken. A lock is written in two
-// steps — create, then write the pid — so a lock found empty may simply be one
-// created microseconds ago. Waiting this long before believing it is abandoned
-// costs nothing on the happy path and avoids stealing a lock from a holder that
-// had not finished announcing itself.
-const CONFIG_LOCK_STALE_MS = 15_000;
-
-// Is this process alive? Signal 0 performs the permission and existence checks
-// without delivering anything. EPERM means it exists under another uid, which
-// still answers the question that matters here: something holds this lock.
-function processAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+// Identity of the current holder, for telling "someone else took their turn"
+// from "the same process is still sitting here". Null when the lock is gone or
+// says nothing about who holds it.
+function lockHolder(lockPath) {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
-  }
-}
-
-// Who holds the lock: its pid, and how long the file has existed. A lock whose
-// contents are unreadable or not a pid is treated as ownerless, which the
-// caller resolves by the staleness rule rather than by trusting it forever.
-async function readLockHolder(lockPath) {
-  try {
-    const [text, info] = await Promise.all([
-      readFile(lockPath, 'utf-8').catch(() => ''),
-      stat(lockPath),
-    ]);
-    const pid = Number.parseInt(String(text).trim(), 10);
-    return { pid: Number.isInteger(pid) ? pid : null, ageMs: Date.now() - info.mtimeMs };
+    const { pid, at } = JSON.parse(readFileSync(lockPath, 'utf8'));
+    return `${pid}:${at}`;
   } catch {
-    // Gone: the next open() attempt is the one that decides what that means.
     return null;
   }
 }
 
-async function acquireConfigLock() {
-  const configPath = await realpath(getConfigPath()).catch(() => getConfigPath());
-  const lockPath = `${configPath}.lock`;
-  while (true) {
-    try {
-      const handle = await open(lockPath, 'wx', 0o600);
-      // Announce ownership so a later waiter can tell a live holder from the
-      // remains of one that was killed.
-      await handle.write(`${process.pid}\n`, 0, 'utf-8').catch(() => {});
-      await handle.sync?.().catch(() => {});
-      return async () => {
-        await handle.close().catch(() => {});
-        await unlink(lockPath).catch(() => {});
-      };
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      const holder = await readLockHolder(lockPath);
-      // Released while we looked: retry immediately rather than sleeping.
-      if (holder) {
-        const ownerless = holder.pid == null || !processAlive(holder.pid);
-        if (ownerless && holder.ageMs >= CONFIG_LOCK_STALE_MS) {
-          // The holder is gone and left the lock behind. Remove it and race for
-          // it like everyone else; losing that race is fine, the winner is a
-          // live holder we will then wait on.
-          await unlink(lockPath).catch(() => {});
-          continue;
-        }
-      }
-      await new Promise(resolve => setTimeout(resolve, 10 + Math.floor(Math.random() * 20)));
-    }
+function lockIsStale(lockPath) {
+  let pid, at;
+  try {
+    ({ pid, at } = JSON.parse(readFileSync(lockPath, 'utf8')));
+  } catch (err) {
+    if (err.code === 'ENOENT') return false; // released under us; the retry takes it
+    // Empty or garbled: the holder is between its open and its write, or died
+    // there. Only the file's age can tell those apart.
+    try { return Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { return false; }
   }
+  // Liveness first. A process that is gone is stale whatever the clock says, so
+  // a crashed holder is cleared on the next poll instead of after the window.
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); } catch (err) { if (err.code === 'ESRCH') return true; }
+  }
+  return Date.now() - at > LOCK_STALE_MS;
+}
+
+/** True when the lock is ours; false when we gave up and proceed without it. */
+async function acquireConfigLock(lockPath) {
+  let heldBy = null;
+  let heldSince = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() })); } finally { closeSync(fd); }
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        console.error(`[TeamClaude] Cannot create ${lockPath} (${err.code || err.message}); writing the config without it`);
+        return false;
+      }
+    }
+    if (lockIsStale(lockPath)) {
+      await unlink(lockPath).catch(() => {});
+      continue;
+    }
+    const holder = lockHolder(lockPath);
+    if (holder !== heldBy) {
+      // The queue advanced: a new holder gets its own budget.
+      heldBy = holder;
+      heldSince = Date.now();
+    } else if (Date.now() - heldSince > LOCK_STALE_MS * 2) {
+      // One holder, alive, past twice the staleness window without the stale
+      // rule firing: its clock disagrees with ours badly enough that waiting is
+      // no longer bounded by anything. Degrade rather than hang.
+      console.error(`[TeamClaude] ${lockPath} is still held by the same process after ${Date.now() - heldSince}ms; writing the config without it`);
+      return false;
+    }
+    await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+  }
+}
+
+// One queue per lock path inside this process: same-process callers (the TUI
+// saving while a token refresh runs) would otherwise spin against their own
+// live lock file for the full 2 s.
+const lockQueues = new Map();
+
+/**
+ * Run `fn` while holding the advisory lock for `configPath` (protocol above).
+ * Same-process callers are queued; other processes are held off by the file.
+ * The lock is released whether `fn` resolves or throws.
+ */
+export function withConfigLock(configPath, fn) {
+  const lockPath = `${configPath}.lock`;
+  const run = async () => {
+    await mkdir(dirname(lockPath), { recursive: true });
+    const held = await acquireConfigLock(lockPath);
+    try {
+      return await fn();
+    } finally {
+      if (held) await unlink(lockPath).catch(() => {});
+    }
+  };
+  const prev = lockQueues.get(lockPath) || Promise.resolve();
+  const result = prev.then(run, run);
+  lockQueues.set(lockPath, result.then(() => {}, () => {}));
+  return result;
+}
+
+export async function saveConfig(config) {
+  const path = getConfigPath();
+  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
+  // for why this is not a plain writeFile.
+  await withConfigLock(path, () => writeJsonAtomic(path, config));
 }
 
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
  * made by other processes (e.g. `teamclaude import` while the server runs), and
- * serializes concurrent callers so simultaneous updates queue instead of
- * clobbering one another.
+ * holds the config lock across the read and the write so a concurrent writer —
+ * in this process or another — waits its turn instead of clobbering the update.
  */
 export function atomicConfigUpdate(updater) {
-  const run = async () => {
-    const release = await acquireConfigLock();
-    try {
-      const config = await loadConfig() || createDefaultConfig();
-      await updater(config);
-      await saveConfig(config);
-      return config;
-    } finally {
-      await release();
-    }
-  };
-  const result = configUpdateChain.then(run, run);
-  configUpdateChain = result.then(() => {}, () => {});
-  return result;
+  const path = getConfigPath();
+  return withConfigLock(path, async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await writeJsonAtomic(path, config);
+    return config;
+  });
 }

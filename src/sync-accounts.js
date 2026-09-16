@@ -1,11 +1,15 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { safeLine } from './safe-text.js';
 import { ensureAccountIds } from './account-id.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
+ * @param {Record<string, any>} diskConfig
+ * @param {Record<string, any>} memConfig
+ * @param {import('./account-manager.js').AccountManager} accountManager
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
@@ -14,7 +18,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // same-person/different-org entries pair correctly instead of all matching the
   // first one with that accountUuid.
   const claimed = new Set();
-  const claim = (diskAcct) => {
+  const claim = (/** @type {Record<string, any>} */ diskAcct) => {
     for (let i = 0; i < accountManager.accounts.length; i++) {
       if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
         claimed.add(i);
@@ -30,7 +34,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // its entries never receive the org backfill below, so a first-match scan
   // pairs an unorged entry with whichever same-uuid disk entry comes first.
   const cfgClaimed = new Set();
-  const claimConfig = (diskAcct) => {
+  const claimConfig = (/** @type {Record<string, any>} */ diskAcct) => {
     for (let i = 0; i < memConfig.accounts.length; i++) {
       if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
@@ -84,7 +88,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+    for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
@@ -98,8 +102,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // disk edit must land here to take effect on reload. `|| null` mirrors the
     // constructor's normalization, letting a removal on disk revert the account
     // to the fleet default instead of sticking on the old value.
+    // Re-arm the one-shot operator line whenever either input it reports on
+    // changes — the setting, or the upstream it was reported for. An operator
+    // who takes `messageThreads` back off, or who moves the account to a
+    // different backend, needs to be told again that continues are refused;
+    // otherwise their only signal stays silent. Read before the assignments
+    // below, which are what it compares against.
+    if (mgr.upstream !== (diskAcct.upstream || null)
+      || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    // Read per request like the two above (server.js rewriteRequestBody), and
+    // missing from this sync until #374: an edit waited for a restart.
+    mgr.stripRequestFields = diskAcct.stripRequestFields || null;
+    mgr.messageThreads = diskAcct.messageThreads === true;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
     // so a stale key there would win the spread and silently overwrite this
@@ -109,6 +125,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
+      if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
@@ -116,13 +134,14 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
+      } catch (/** @type {any} */ err) {
+        console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
@@ -141,12 +160,12 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
+        console.log(`[TeamClaude] Refreshed credentials for "${safeLine(mgr.name, 64)}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }
   return added;

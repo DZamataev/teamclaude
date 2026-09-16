@@ -189,6 +189,8 @@ test('getStatus exposes session counts (known/active/perAccount) and the mode fl
   assert.equal(status.sessions.distribute, true);
   assert.equal(status.accounts[0].sessions, 1);
   assert.equal(status.accounts[1].sessions, 1);
+  assert.equal(status.accounts[0].knownSessions, 1);
+  assert.equal(status.accounts[1].knownSessions, 1);
 });
 
 test('setDistributeSessions applies a config change live', () => {
@@ -308,4 +310,49 @@ test('draining: turning distribution off when it was already off starts no drain
   am.recordSession('sess-1', 0);
   am.setDistributeSessions(false);
   assert.equal(am.getStatus().sessions.draining, 0);
+});
+
+// ── Untagged requests ───────────────────────────────────────────────────────
+
+// The Codex CLI tags POST /responses but not its catalog fetch, and Claude Code
+// tags /v1/messages but not its telemetry. Those requests have no session to
+// pin, so selection used to rest every one of them on the current account: on a
+// five-account Codex pool that put one account 16 requests ahead of siblings
+// sitting at 1. Without this the skew is silent — the requests spend no quota,
+// so only the request counter shows it.
+test('distribution on: untagged requests spread instead of resting on one account', () => {
+  const am = mgr(['a', 'b', 'c'], { distributeSessions: true });
+  const seen = new Set();
+  for (let i = 0; i < 6; i++) seen.add(am.getActiveAccount(null, null, null, null).name);
+  assert.deepEqual([...seen].sort(), ['a', 'b', 'c']);
+});
+
+// The cursor an untagged request turns is its own. `_setCurrent` is what the
+// sessions riding the shared one follow, so a catalog fetch that moved it would
+// hand a running conversation to another account mid-flight and throw away the
+// prompt cache it built there.
+test('an untagged request leaves the shared cursor where it was', () => {
+  const am = mgr(['a', 'b', 'c'], { distributeSessions: true });
+  const before = am.currentIndex;
+  for (let i = 0; i < 6; i++) am.getActiveAccount(null, null, null, null);
+  assert.equal(am.currentIndex, before);
+});
+
+// Distribution is opt-in, and off is the default. An untagged request must go
+// on resting on the current account there, or turning the feature off would
+// stop meaning what it says.
+test('distribution off: untagged requests stay on the current account', () => {
+  const am = mgr(['a', 'b', 'c']); // distributeSessions defaults false
+  const names = [];
+  for (let i = 0; i < 4; i++) names.push(am.getActiveAccount(null, null, null, null).name);
+  assert.deepEqual(names, ['a', 'a', 'a', 'a']);
+});
+
+// Spreading picks among the accounts that could serve the request, not all of
+// them: an excluded account is one this request has already failed on.
+test('untagged spreading skips excluded accounts', () => {
+  const am = mgr(['a', 'b', 'c'], { distributeSessions: true });
+  const seen = new Set();
+  for (let i = 0; i < 6; i++) seen.add(am.getActiveAccount(new Set([1]), null, null, null).name);
+  assert.deepEqual([...seen].sort(), ['a', 'c']);
 });

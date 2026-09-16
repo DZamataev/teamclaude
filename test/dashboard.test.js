@@ -6,6 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
+  accountBadges,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
@@ -56,6 +57,22 @@ test('account token total includes the cache fields', () => {
   }), 113);
   assert.equal(accountTokens({}), 0);
   assert.equal(accountTokens(null), 0);
+});
+
+test('account metadata and session state are separate badges', () => {
+  const badges = accountBadges({
+    name: 'corp', provider: 'codex', type: 'oauth', priority: -2,
+    status: 'active', sessions: 1, knownSessions: 3,
+  }, 'legacy', { anthropic: 'personal', codex: 'corp' });
+  assert.deepEqual(badges, [
+    { cls: 'provider codex', text: 'Codex' },
+    { cls: 'meta', text: 'oauth' },
+    { cls: 'meta priority', text: 'prio -2' },
+    { cls: 'current', text: 'current' },
+    { cls: 'active', text: 'active' },
+    { cls: 'sessions', text: '1 recent' },
+    { cls: 'sessions known', text: '3 known' },
+  ]);
 });
 
 const SESSIONS = {
@@ -175,6 +192,32 @@ test('the switch button\'s request passes the same-origin gate and moves the cur
   }
 });
 
+test('the dashboard exposes reload and one-shot probe controls', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /id="reload"/);
+  assert.match(html, /id="probe"/);
+  assert.match(html, /\/teamclaude\/reload/);
+  assert.match(html, /\/teamclaude\/probe/);
+});
+
+test('the probe control invokes the server hook', async () => {
+  let calls = 0;
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-x' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' }, {
+    probeQuota: async () => { calls++; },
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/probe`, {
+      method: 'POST', headers: { origin: `http://127.0.0.1:${port}`, 'sec-fetch-site': 'same-origin' },
+    });
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(calls, 1);
+  } finally {
+    proxy.close();
+  }
+});
+
 // The shape /teamclaude/status reports per route: the server's own target for
 // the family, and every account with whether it could serve it.
 const ROUTED = {
@@ -184,6 +227,44 @@ const ROUTED = {
     accounts: [{ name: 'a', eligible: false }, { name: 'b', eligible: true }, { name: 'c', eligible: true }],
   }],
 };
+
+test('dashboard payload identifies both provider cursors without one false global current', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'codex', type: 'oauth', provider: 'codex', accountId: 'acct', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.getActiveAccount(null, 'gpt-5.6-sol', null, null, 'codex');
+
+  const status = am.getStatus();
+  assert.deepEqual(status.currentAccounts, { anthropic: 'claude', codex: 'codex' });
+  const html = renderDashboardHtml();
+  assert.match(html, /currentAccounts/);
+  assert.match(html, /providerLabel/);
+});
+
+test('mixed-provider routing reports one default row per provider', () => {
+  const rows = routeRows({
+    currentAccount: 'codex',
+    currentAccounts: { anthropic: 'claude', codex: 'codex' },
+    defaultTargets: { anthropic: 'claude', codex: 'codex' },
+    accounts: [
+      { name: 'claude', provider: 'anthropic', unavailable: null },
+      { name: 'codex', provider: 'codex', unavailable: null },
+    ],
+    routes: [{
+      name: 'fable', provider: 'anthropic', match: ['*fable*'], target: 'claude',
+      accounts: [{ name: 'claude', eligible: true }],
+    }],
+  });
+  assert.deepEqual(
+    rows.map(r => ({ label: r.label, provider: r.provider, target: r.target })),
+    [
+      { label: 'Fable', provider: 'anthropic', target: 'claude' },
+      { label: 'Claude default', provider: 'anthropic', target: 'claude' },
+      { label: 'Codex default', provider: 'codex', target: 'codex' },
+    ],
+  );
+});
 
 test('route rows say where each family goes, why, and where everything else goes', () => {
   const rows = routeRows(ROUTED);
@@ -400,6 +481,67 @@ test('the page ships the same helper implementations it is tested against', () =
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
   assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+});
+
+// Run the page's whole inline script against a stub DOM, a stub localStorage and
+// a fetch the test answers by hand. Elements absorb any method call, so render()
+// runs without a real DOM; only the style and text the startup path sets are read.
+function bootPage({ storedKey = null } = {}) {
+  const els = new Map();
+  const stubEl = () => {
+    const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
+    return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+  };
+  const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
+  const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
+  const localStorage = {
+    getItem: k => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: k => store.delete(k),
+  };
+  const requests = [];
+  const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
+  const document = { getElementById: byId, createElement: () => stubEl() };
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
+    document, localStorage, fetch, () => 1, () => {});
+  const answer = async (status, body = {}) => {
+    requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
+    await new Promise(r => setImmediate(r));
+  };
+  return { byId, store, requests, answer };
+}
+
+test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
+  const page = bootPage();
+  assert.equal(page.requests.length, 1, 'polls on load with no stored key');
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  assert.equal(page.requests[0].init.headers['x-api-key'], '');
+  assert.notEqual(page.byId('keybox').style.display, 'block', 'no prompt before the server answers');
+
+  await page.answer(200, { accounts: [] });
+  assert.notEqual(page.byId('keybox').style.display, 'block');
+  assert.equal(page.byId('app').style.display, '');
+});
+
+for (const status of [401, 403]) {
+  test(`a ${status} on the status poll brings the key prompt up and drops the stored key`, async () => {
+    const page = bootPage({ storedKey: 'tc-stale' });
+    assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-stale');
+    await page.answer(status);
+    assert.equal(page.byId('keybox').style.display, 'block');
+    assert.equal(page.byId('app').style.display, 'none');
+    assert.equal(page.store.size, 0);
+  });
+}
+
+test('a first poll that fails shows its error instead of a blank page', async () => {
+  const page = bootPage();
+  await page.answer(500);
+  assert.equal(page.byId('err').style.display, 'block');
+  assert.match(page.byId('err').textContent, /status 500/);
+  assert.equal(page.byId('app').style.display, '');
 });
 
 test('dashboard page is self-contained: no external resources', () => {

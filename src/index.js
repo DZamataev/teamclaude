@@ -35,17 +35,18 @@ import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 import { runDeployCli } from './deploy/cli.js';
 import { resolveControlHost, runWatchDashboard } from './watch-dashboard.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -140,6 +141,10 @@ switch (command) {
     break;
   case 'attach':
     await attachCommand();
+    process.exit(0);
+    break;
+  case 'dashboard':
+    await dashboardCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -379,6 +384,15 @@ async function serverCommand() {
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
+  // What the header names this build, and whether the last recorded check saw
+  // something newer. A checkout gets no update marker: autoUpdate refuses to
+  // npm-install over one, so offering it would advertise a declined action.
+  const { label: versionLabel, git: fromGit } = await resolveVersionLabel();
+  const updateAvailable = !fromGit && await updateAvailableFromCache({ current: serverVersion });
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -433,6 +447,12 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
+    // Both are read per request off this object (server.js) and the TUI already
+    // persists them; without this a hand edit or another writer waited for a restart.
+    config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
+    config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
+    config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -467,11 +487,12 @@ async function serverCommand() {
   };
 
   let tui = null;
+  /** @type {Object} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath, sessionTitles,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         diskConfig.accounts = mergeAccountsForSave(
           config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
@@ -492,6 +513,7 @@ async function serverCommand() {
         // screen too; the server reads them live from `config`, but without this
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Persist the route table (edited from the TUI routes screen).
@@ -569,6 +591,9 @@ async function serverCommand() {
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
     server: {
+      version: serverVersion,
+      versionLabel,
+      updateAvailable,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
@@ -668,6 +693,10 @@ async function serverCommand() {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });
+  // The web dashboard's one-shot probe button uses the same zero-spend action
+  // as the TUI's `p` key. Assigned after construction because the hook object
+  // is already shared with the server created above.
+  hooks.probeQuota = () => prober?.probeAll();
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
@@ -683,6 +712,9 @@ async function serverCommand() {
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  // Not awaited, and nothing inside it is synchronous: the npm probe and the
+  // install are child processes the loop runs beside (#353), so this never
+  // holds up a request.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
@@ -869,7 +901,7 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -881,15 +913,20 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    name = `api-${n}`;
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  // The prompt above waits on the user for as long as they take, and a running
+  // server may have rotated an OAuth account's refresh token on disk meanwhile.
+  // Saving the copy loaded before the prompt would put the dead token back and
+  // lose that account on its next restart, so the row is added to a fresh read.
+  const config = await atomicConfigUpdate(disk => {
+    if (!name) {
+      const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
+      name = `api-${n}`;
+    }
+    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
@@ -930,7 +967,13 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
-  const useMitm = !args.slice(1).includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, args.slice(1)) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    process.stderr.write(`teamclaude env: ${err.message}\n`);
+    process.exit(1);
+  }
 
   let caPath = null;
   // The leaf has to name every host MITM will intercept, or the CONNECT for
@@ -944,7 +987,13 @@ async function envCommand() {
     lines = buildClaudeEnvLines({
       port, useMitm, caPath, holdSeconds: config.holdSeconds,
       account, proxyApiKey: config.proxy?.apiKey || '',
+      // The shell doing the eval keeps its own NO_PROXY entries; re-running is
+      // idempotent, since the merged value is what it will have next time.
+      inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
     });
+    // Base-URL mode takes the proxy back OUT of a shell an earlier MITM eval
+    // put it into; only this proxy's own loopback address is unset.
+    if (!useMitm) lines.push(...clearSelfProxyEnvLines(port));
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
     process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
@@ -962,7 +1011,9 @@ async function envCommand() {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  // The flag that reproduces this mode whatever the config's default says.
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ' --no-mitm'})"\n`);
+  process.stderr.write(`# default mode is ${config.defaultClientMode === 'base-url' ? 'base-URL' : 'MITM'} (config defaultClientMode; the TUI settings screen toggles it)\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -979,12 +1030,18 @@ async function runCommand() {
   // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
   // before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
-  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
-  // --mitm is still accepted (now a no-op) for backward compatibility.
+  // endpoints are intercepted too; the config's `defaultClientMode` can make
+  // base-URL the default instead, and --mitm / --no-mitm decide per launch.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, tcFlags) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    console.error(`[TeamClaude] ${err.message}`);
+    process.exit(1);
+  }
   const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
@@ -1022,7 +1079,13 @@ async function runCommand() {
         : '';
       const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      // Keep the operator's own NO_PROXY and add ours — see mergeNoProxy. Both
+      // spellings are read: a tool that set only one still meant it.
+      const inheritedNoProxy = [process.env.NO_PROXY, process.env.no_proxy];
+      env.NO_PROXY = env.no_proxy = mergeNoProxy(...inheritedNoProxy);
+      if (inheritedNoProxy.some(bypassesAllHosts)) {
+        console.error('[TeamClaude] NO_PROXY=* ignored: it would send api.anthropic.com around the proxy (no rotation). Use --no-mitm for a direct launch.');
+      }
       env.NODE_EXTRA_CA_CERTS = caPath;
       if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
       else if (pinnedBase) {
@@ -1074,7 +1137,7 @@ async function runCommand() {
   });
 
   if (result.error) {
-    if (result.error.code === 'ENOENT') {
+    if (/** @type {CodedError} */ (result.error).code === 'ENOENT') {
       console.error('Claude Code not found in PATH. Install it first.');
     } else {
       console.error(`Failed to start claude: ${result.error.message}`);
@@ -1091,6 +1154,20 @@ async function runCommand() {
 }
 
 // ── status ──────────────────────────────────────────────────
+
+// process.stdout.write is asynchronous when stdout is a pipe, so a write that
+// is followed by process.exit loses whatever has not reached the pipe yet: on
+// macOS a 15 KB status came out as its first 512 bytes through `| jq`. This
+// resolves once the bytes are handed off. A reader that quits early (`| head`)
+// raises EPIPE, which console.log swallows; the listener keeps that behaviour.
+function writeStdout(text) {
+  return new Promise(resolve => {
+    process.stdout.write(text, err => {
+      if (err) process.stdout.once('error', () => {});
+      resolve();
+    });
+  });
+}
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
@@ -1113,10 +1190,10 @@ async function statusCommand() {
     });
     const data = await res.json();
     if (json) {
-      console.log(JSON.stringify(data, null, 2));
+      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
       return;
     }
-    console.log(renderStatus(data, { color }));
+    await writeStdout(`${renderStatus(data, { color })}\n`);
   } catch (err) {
     if (err?.name === 'TimeoutError') {
       console.error(`Proxy at localhost:${config.proxy.port} did not answer status within ${timeoutMs}ms.`);
@@ -1171,6 +1248,30 @@ async function attachCommand() {
     session.am.applyStatus(first);
     session.start();
   });
+}
+
+// Open the browser dashboard against a running server. The page is served by
+// the proxy itself, so this is `attach` for the browser: it does not start a
+// server. A background daemon started from here would run with no log and no
+// supervisor, which is what `teamclaude service install` exists to avoid.
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
+  if (!(await isProxyUp(port))) {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server   (or: teamclaude service install)');
+    process.exit(1);
+  }
+
+  console.log(`Dashboard: ${dashboardUrl}`);
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  const opened = spawnSync(opener, process.platform === 'win32' ? ['', dashboardUrl] : [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
 // ── switch ──────────────────────────────────────────────────
@@ -1909,7 +2010,7 @@ async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
 
-  const kind = installKind();
+  const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
     return;
@@ -1927,7 +2028,7 @@ async function updateCommand() {
   }
 
   console.log(`Updating ${info.current} → ${info.latest} …`);
-  const ok = runUpdate(info.latest);
+  const ok = await runUpdate(info.latest);
   if (ok) {
     console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
   } else {
@@ -2127,10 +2228,12 @@ Commands:
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
-  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
-                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+  env [--mitm|--no-mitm]
+                      Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"'. MITM forward-proxy unless the
+                      config's defaultClientMode is "base-url"; a flag decides
+                      per call. Handy for agent multiplexers that spawn claude
+                      themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
@@ -2152,6 +2255,7 @@ Commands:
                       quota and Anthropic service status; refreshes every minute
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
+  dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
   client <sub>        Manage per-client proxy keys: add | list | remove
   switch [NAME]       Make the running server prefer one account (as 's' in the
@@ -2441,7 +2545,14 @@ function startTerminalTitleUpdater(accountManager) {
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes; account removals still need a restart.
+// changes, plus eventLogging and blockedModels edits; account removals still
+// need a restart.
+//
+// `strict` makes a refused reload fail the command instead of passing quietly:
+// a freshly minted client key that the running server never picked up is worse
+// than a visible error, since the operator hands it out and it is rejected. It
+// carries its own `apiKey` because the key the CLI just wrote is not the one
+// this process loaded.
 async function notifyRunningServer(config, { strict = false, apiKey = config?.proxy?.apiKey || '' } = {}) {
   const port = config?.proxy?.port;
   if (!port) return;

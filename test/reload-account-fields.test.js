@@ -133,6 +133,54 @@ async function sendMessage(proxyPort, model) {
   }
 }
 
+// A continue is the witness for messageThreads: with the flag off the proxy
+// answers it itself and the stub sees nothing, with it on the request goes
+// through untouched.
+async function sendContinue(proxyPort, model) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model, max_tokens: 1, messages: [], thread: { type: 'continue', previous_message_id: 'msg_1' },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    await res.text();
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+test('reload picks up messageThreads being set and removed', async () => {
+  await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
+    const withBackend = JSON.parse(await readFile(configPath, 'utf8'));
+    withBackend.accounts[0].upstream = `http://127.0.0.1:${stubPort}`;
+    await writeFile(configPath, JSON.stringify(withBackend));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 400, 'setup: a backend with no thread state refuses the continue');
+    assert.equal(hits.length, 0, 'setup: the refused continue must not reach the stub');
+
+    // The operator declares the backend keeps thread state.
+    const declared = JSON.parse(await readFile(configPath, 'utf8'));
+    declared.accounts[0].messageThreads = true;
+    await writeFile(configPath, JSON.stringify(declared));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 200);
+    assert.equal(hits.length, 1, 'a declared backend must receive the continue');
+
+    // And taking it back off must revert the running account, not stick until a
+    // restart — the disk is the source of truth on every reload.
+    const reverted = JSON.parse(await readFile(configPath, 'utf8'));
+    delete reverted.accounts[0].messageThreads;
+    await writeFile(configPath, JSON.stringify(reverted));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 400);
+    assert.equal(hits.length, 1, `the stub must see no further requests, got ${hits.length}`);
+  });
+});
+
 test('reload picks up upstream and modelMap edits for an existing account', async () => {
   await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
     // The disk edit a user makes to bolt a third-party backend onto the account.
@@ -174,5 +222,44 @@ test('reload also picks up the REMOVAL of upstream and modelMap', async () => {
     // day) is not the verdict — the stub seeing no further traffic is.
     assert.ok(res === null || res.status >= 500, `with the override gone the request must not succeed, got ${res?.status}`);
     assert.equal(hits.length, 1, `the stub must see no further requests, got ${hits.length}`);
+  });
+});
+
+// `stripRequestFields` is read per request off the running account exactly as
+// `upstream` and `modelMap` are (server.js rewriteRequestBody), but the sync
+// did not carry it, so an edit on disk waited for a restart. Removal was worse:
+// with no delete-on-absence mirror the save stencil (`{ ...diskAcct, ...live }`)
+// wrote the stale key back into the operator's config (#374).
+test('reload picks up a stripRequestFields edit, and its removal', async () => {
+  await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
+    const edited = JSON.parse(await readFile(configPath, 'utf8'));
+    edited.accounts[0].upstream = `http://127.0.0.1:${stubPort}`;
+    edited.accounts[0].stripRequestFields = ['context_management'];
+    await writeFile(configPath, JSON.stringify(edited));
+    await reload(proxyPort);
+
+    const send = async () => {
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-test-model', max_tokens: 1, messages: [], context_management: { edits: [] } }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      await res.text();
+      return res.status;
+    };
+
+    assert.equal(await send(), 200);
+    assert.equal(hits.length, 1);
+    assert.ok(!('context_management' in JSON.parse(hits[0].body)), 'the field listed on disk must be stripped after a reload');
+
+    const trimmed = JSON.parse(await readFile(configPath, 'utf8'));
+    delete trimmed.accounts[0].stripRequestFields;
+    await writeFile(configPath, JSON.stringify(trimmed));
+    await reload(proxyPort);
+
+    assert.equal(await send(), 200);
+    assert.equal(hits.length, 2);
+    assert.ok('context_management' in JSON.parse(hits[1].body), 'removing the entry on disk must stop the stripping');
   });
 });

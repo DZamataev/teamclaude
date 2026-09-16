@@ -3,6 +3,7 @@ import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 import { timeoutSignal } from './abort.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -25,6 +26,7 @@ const text = (value, max, fallback = '') => {
   return safeLine(value, max) || fallback;
 };
 const NAME_MAX = 64;
+const LABEL_MAX = 32;
 
 // Addresses that reach this machine. A server bound to one of these exempts
 // loopback clients from the proxy-key gate, which changes what a 401 can mean.
@@ -97,6 +99,7 @@ export class RemoteControl {
 
   async _call(method, path, body, signal = null) {
     const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    /** @type {Record<string, string>} */
     const headers = {};
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     if (body !== undefined) headers['content-type'] = 'application/json';
@@ -135,11 +138,11 @@ export class RemoteControl {
       // clients from the key gate, so a 401 from there cannot be about the key
       // and blaming it would send the operator to edit a config that is fine.
       const auth = !answered && (res.status === 401 || res.status === 403);
-      const err = new Error(auth
+      const err = /** @type {CodedError} */ (new Error(auth
         ? (LOOPBACK_HOSTS.has(this.host)
           ? `something other than teamclaude is answering on port ${this.port} (HTTP ${res.status})`
           : `the server rejected the proxy API key (HTTP ${res.status})`)
-        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`);
+        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`));
       err.status = res.status;
       err.answered = answered;
       throw err;
@@ -201,6 +204,10 @@ export class RemoteAccountManager {
     this.connected = false;   // false ⇒ the view is a stale snapshot
     this.lastError = null;
     this.status = null;
+    // Empty until the first poll, so the header shows no version rather than
+    // this process's own — in attach mode that would name the wrong machine.
+    this.versionLabel = '';
+    this.updateAvailable = false;
   }
 
   /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
@@ -269,6 +276,10 @@ export class RemoteAccountManager {
       accounts: (Array.isArray(r?.accounts) ? r.accounts : [])
         .map(a => ({ ...a, name: text(a?.name, NAME_MAX, '?'), eligible: !!a?.eligible })),
     }));
+    // A server too old to send versionLabel still sends version; one older than
+    // both leaves the label empty and the header simply omits it.
+    this.versionLabel = text(status?.server?.versionLabel ?? status?.server?.version, LABEL_MAX);
+    this.updateAvailable = !!status?.server?.updateAvailable;
     this.status = status;
     this.connected = true;
     this.lastError = null;

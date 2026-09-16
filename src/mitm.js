@@ -24,6 +24,7 @@ import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpg
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -128,6 +129,11 @@ export function hostMode(host, config) {
   // Explicitly never intercepted, even though it sits under a provider's domain
   // — checked before anything else so no later rule can claim it.
   if (isNeverIntercepted(host)) return 'tunnel';
+  // In terminal-only mode the MITM must never terminate ChatGPT Desktop's
+  // connection. Terminal Codex uses the explicit /backend-api/codex base URL;
+  // this host-level bypass keeps Desktop's native auth and feature endpoints
+  // outside TeamClaude entirely.
+  if (config?.proxy?.terminalOnly === true && host === 'chatgpt.com') return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
   // A second provider's host, and only when an account actually uses that
   // provider. MITM is the mode that works without the client cooperating — a
@@ -191,7 +197,17 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
- * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
+ * @param {Object} opts
+ * @param {Object} opts.config
+ * @param {Object} opts.accountManager
+ * @param {() => Promise<{ key: string, cert: string }>} opts.ensureLeaf  current leaf PEMs
+ * @param {string|null} [opts.logDir]
+ * @param {Object} [opts.hooks]
+ * @param {(line: string) => void} [opts.log]
+ * @param {Object|null} [opts.sx]
+ * @param {Object|null} [opts.egress]
+ * @param {Object|null} [opts.clientUsage]
+ * @param {Object|null} [opts.dimensionUsage]
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -241,17 +257,25 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
+    // Guarded for the same reason the listener in server.js is: an uncaught
+    // throw here exits the process (#340).
     srv.on('upgrade', (req, socket, head) => {
-      const target = upgradeUpstreamFor(req.headers.host, config, upstream);
-      if (!target) {
-        log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
-        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+      try {
+        const target = upgradeUpstreamFor(req.headers.host, config, upstream);
+        if (!target) {
+          log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
+          try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
+        // The CONNECT's client identity is bound to this listener (see getServer),
+        // so the channel is attributed the way the requests in the tunnel are.
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
+      } catch (err) {
+        log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
+        try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
         socket.destroy();
-        return;
       }
-      // The CONNECT's client identity is bound to this listener (see getServer),
-      // so the channel is attributed the way the requests in the tunnel are.
-      relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
     });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
@@ -356,7 +380,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      up.on('error', (err) => {
+      up.on('error', (/** @type {CodedError} */ err) => {
         if (err.code === FORBIDDEN_FORWARD) {
           log(`[TeamClaude] CONNECT ${host}:${port} refused: ${err.message}`);
           teardown('403 Forbidden');
