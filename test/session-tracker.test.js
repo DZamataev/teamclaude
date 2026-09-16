@@ -460,7 +460,7 @@ test('stats counts sessions per client, active and known apart', () => {
   st.beginRequest('s3', clock.t, { client: 'steamdeck' });
   st.endRequest('s3', clock.t);
 
-  assert.deepEqual(st.stats(clock.t).perClient, {
+  assert.deepEqual({ ...st.stats(clock.t).perClient }, {
     mbp: { active: 2, known: 2 },
     steamdeck: { active: 1, known: 1 },
   });
@@ -472,7 +472,7 @@ test('stats counts sessions per client, active and known apart', () => {
   st.beginRequest('s1', clock.t, { client: 'mbp' });
   st.endRequest('s1', clock.t);
 
-  assert.deepEqual(st.stats(clock.t).perClient, {
+  assert.deepEqual({ ...st.stats(clock.t).perClient }, {
     mbp: { active: 1, known: 2 },
     steamdeck: { active: 0, known: 1 },
   });
@@ -491,7 +491,37 @@ test('stats leaves an unattributed session out of every per-client count', () =>
   st.endRequest('anonymous', clock.t);
 
   const stats = st.stats(clock.t);
-  assert.deepEqual(stats.perClient, { mbp: { active: 1, known: 1 } });
+  assert.deepEqual({ ...stats.perClient }, { mbp: { active: 1, known: 1 } });
   assert.equal(stats.active, 2);   // still counted in the fleet totals
   assert.equal(stats.known, 2);
+});
+
+// A client name is operator config, but `__proto__` and `constructor` are not
+// ordinary strings to a plain object: the accumulator would resolve the
+// INHERITED member instead of creating a row, so that client's sessions vanish
+// from the report — and the increment lands on Object.prototype, corrupting
+// every plain object in the process for the rest of its life.
+test('a client named __proto__ is counted, and no prototype is touched', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+
+  for (const name of ['__proto__', 'constructor', 'ordinary']) {
+    st.beginRequest(`s-${name}`, clock.t, { client: name });
+    st.endRequest(`s-${name}`, clock.t);
+  }
+
+  const perClient = st.stats(clock.t).perClient;
+  // Computed keys: a bare `__proto__:` in an object literal sets the literal's
+  // PROTOTYPE instead of adding that key, which is the same footgun the
+  // implementation is being tested for.
+  assert.deepEqual({ ...perClient }, {
+    ['__proto__']: { active: 1, known: 1 },
+    ['constructor']: { active: 1, known: 1 },
+    ['ordinary']: { active: 1, known: 1 },
+  });
+  // The row is the client's own, not something inherited.
+  assert.ok(Object.prototype.hasOwnProperty.call(perClient, '__proto__'));
+  // And nothing leaked onto every object in the process.
+  assert.equal({}.known, undefined);
+  assert.equal({}.active, undefined);
 });

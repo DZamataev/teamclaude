@@ -111,7 +111,7 @@ function renderUsageEntries(lines, entries, paint, now, limit = Infinity, perCli
   entries.sort(([an, a], [bn, b]) => {
     const activeDiff = clientActiveSessions(perClient, bn) - clientActiveSessions(perClient, an);
     if (activeDiff) return activeDiff;
-    return ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0));
+    return tokenTotal(b) - tokenTotal(a);
   });
   for (const [name, c] of entries.slice(0, limit)) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
@@ -129,8 +129,28 @@ function renderUsageEntries(lines, entries, paint, now, limit = Infinity, perCli
 // not a finite number is none. Shared with the sort, so the row that is printed
 // and the reason it was ranked there cannot disagree.
 function clientActiveSessions(perClient, name) {
-  const row = perClient && typeof perClient === 'object' ? perClient[name] : null;
-  return Number.isFinite(row?.active) ? row.active : 0;
+  return sessionCountOf(clientRow(perClient, name), 'active');
+}
+
+function clientRow(perClient, name) {
+  if (!perClient || typeof perClient !== 'object') return null;
+  return perClient[name];
+}
+
+// A count off the wire: a non-negative integer, or nothing. `Number.isFinite`
+// alone admits -3 and 2.5, and a session count that renders as `-2/-1 sess`
+// reports a fleet state that cannot exist as though it were measured.
+function sessionCountOf(row, field) {
+  const value = row?.[field];
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+// Lifetime tokens as a number. Coerced per FIELD, because `+` on two strings
+// concatenates: a client reporting "9" and "9" would sort as 99 while its own
+// row renders 18, so the order and the numbers shown would disagree.
+function tokenTotal(entry) {
+  const n = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return n(entry?.inputTokens) + n(entry?.outputTokens);
 }
 
 // " 3 sess" — the conversations this client is holding NOW, ahead of the
@@ -146,9 +166,9 @@ function formatClientSessions(perClient, name, paint) {
   // ever attributed to a named client): the column does not exist and every row
   // renders exactly as it did before.
   if (!perClient || typeof perClient !== 'object' || !Object.keys(perClient).length) return '';
-  const row = perClient[name];
-  const active = Number.isFinite(row?.active) ? row.active : 0;
-  const known = Number.isFinite(row?.known) ? row.known : 0;
+  const row = clientRow(perClient, name);
+  const active = sessionCountOf(row, 'active');
+  const known = sessionCountOf(row, 'known');
   // A fixed-width column once the server reports session counts at all, so the
   // clients holding none still line their request counters up with the ones
   // that do. Without the padding the marker would shift every row it appears
@@ -291,7 +311,7 @@ function activeLabel(adaptiveMode) {
 
 // A session count off the wire: anything that is not a finite number is zero.
 function sessionCount(account) {
-  return Number.isFinite(account?.sessions) ? account.sessions : 0;
+  return sessionCountOf(account, 'sessions');
 }
 
 function formatActive(status, currentAccount, adaptiveMode, paint) {
