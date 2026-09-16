@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, utimes } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -149,4 +149,108 @@ test('statusline snippet fills bars by usage with the status risk gradient', asy
   assert.doesNotMatch(result.stdout, /F7d\s+\[/);
   assert.doesNotMatch(result.stdout, /\bF7\b/);
   assert.match(result.stdout, /\bF7d\b/);
+});
+
+// An account label comes from an OAuth profile or the config file — values this
+// script does not control — and is printed to a terminal through `printf %b`,
+// which expands backslash escapes on top of whatever bytes the name carries.
+// A name holding ESC[2J therefore clears the operator's screen on every status
+// refresh. The Node status renderer strips such bytes with safeLine(); this is
+// the same guarantee for the shipped snippet.
+test('statusline snippet strips terminal escapes out of an account label', async t => {
+  const now = Date.now();
+  const endpoint = await quotaServer(fleetQuota({
+    fiveHour: 0.5,
+    weekly: 0.5,
+    fable: 0.5,
+    fiveHourReset: now + 60 * 60 * 1000,
+    weeklyReset: now + 24 * 60 * 60 * 1000,
+    accounts: [
+      {
+        // No recognised tier, so the label falls back to `.name` — the only
+        // path on which an operator-supplied string reaches the output.
+        name: 'evil\u001b[2JFORGED\u0007',
+        type: 'oauth',
+        disabled: false,
+        status: 'active',
+        tier: {},
+        buckets: {
+          fiveHour: { remaining: 0.5, nextResetAt: now + 60 * 60 * 1000 },
+        },
+      },
+    ],
+  }));
+  t.after(() => endpoint.close());
+
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), 'statusline-escape-'));
+  t.after(() => rm(cacheDir, { recursive: true, force: true }));
+
+  const { code, stdout } = await runSnippet({
+    TEAMCLAUDE_BASE_URL: endpoint.url,
+    XDG_CACHE_HOME: cacheDir,
+    NO_COLOR: '1',
+  });
+
+  assert.equal(code, 0);
+  assert.match(stdout, /FORGED/, 'the account is still shown');
+  assert.doesNotMatch(stdout, /\u001b\[2J/, 'no clear-screen sequence reaches the terminal');
+  assert.doesNotMatch(stdout, /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/, 'no raw control bytes survive');
+});
+
+// A payload whose accounts are all disabled is valid and renders its aggregate
+// line; the `[ -n … ] && printf` guard must not become the script's exit status.
+test('statusline snippet exits 0 when there is no account row to print', async t => {
+  const endpoint = await quotaServer(fleetQuota({
+    fiveHour: 0.5, weekly: 0.5, fable: 0.5, accounts: [],
+  }));
+  t.after(() => endpoint.close());
+
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), 'statusline-empty-'));
+  t.after(() => rm(cacheDir, { recursive: true, force: true }));
+
+  const { code, stdout } = await runSnippet({
+    TEAMCLAUDE_BASE_URL: endpoint.url,
+    XDG_CACHE_HOME: cacheDir,
+    NO_COLOR: '1',
+  });
+
+  assert.equal(code, 0, 'a valid payload with no printable accounts is not a failure');
+  assert.match(stdout, /Σ 5h/, 'the aggregate line is still printed');
+});
+
+// A status line refreshes on every prompt, so the proxy being briefly away is
+// the normal case, not an exceptional one. Quota moves slowly enough that a
+// reading from minutes ago is still informative, and a line that simply
+// vanishes reads as "no quota to show" rather than "could not ask".
+test('statusline snippet falls back to a stale cache when the refresh fails', async t => {
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), 'statusline-stale-'));
+  t.after(() => rm(cacheDir, { recursive: true, force: true }));
+
+  // Seed the cache through a normal run, then take the server away.
+  const endpoint = await quotaServer(fleetQuota({
+    fiveHour: 0.4, weekly: 0.6, fable: 0.8,
+  }));
+  const seeded = await runSnippet({
+    TEAMCLAUDE_BASE_URL: endpoint.url,
+    XDG_CACHE_HOME: cacheDir,
+    NO_COLOR: '1',
+  });
+  assert.equal(seeded.code, 0);
+  assert.match(seeded.stdout, /Σ 5h/);
+  await endpoint.close();
+
+  // Age the cache past the freshness window so the script must try the network.
+  const cacheFile = path.join(cacheDir, 'teamclaude', 'statusline-quota.json');
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  await utimes(cacheFile, old, old);
+
+  const { code, stdout } = await runSnippet({
+    // A port nothing listens on: the refresh cannot succeed.
+    TEAMCLAUDE_BASE_URL: 'http://127.0.0.1:9',
+    XDG_CACHE_HOME: cacheDir,
+    NO_COLOR: '1',
+  });
+
+  assert.equal(code, 0);
+  assert.match(stdout, /Σ 5h/, 'the last known reading is still rendered');
 });

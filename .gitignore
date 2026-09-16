@@ -3,5 +3,3 @@ config.json
 *.log
 package-lock.json
 .env.local
-.planning/
-.worktrees/
