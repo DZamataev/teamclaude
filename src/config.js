@@ -178,16 +178,35 @@ export async function loadOrCreateConfig() {
 //
 //   path     <configPath>.lock
 //   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
-//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
-//   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
+//   stale    the pid no longer alive, or `at` older than 10 s: unlink and retry
+//   busy     poll every 25 ms while the holder is alive and turns keep changing
 //   release  unlink
 //
-// The 2 s cap is deliberate: a writer must never hang on a lock, so contention
-// past it degrades to today's behaviour (a possible lost update) plus one
-// warning line, rather than to a stuck server or CLI.
+// A writer must never hang on a lock, so a holder that neither finishes nor
+// goes stale is abandoned after twice the staleness window and the config is
+// written without the lock, with one warning line.
+//
+// The 2 s cap that used to live here bounded the WHOLE wait, which is the one
+// shape it must not: N writers of one file take N turns by construction, so a
+// queue that is working perfectly pushes the writers at the back past any fixed
+// total. Measured on a queue of eight short holders, seven updates were silently
+// dropped — the lost rotated token this lock exists to prevent, now with a
+// warning line attached. The budget is therefore per HOLDER: a live holder is
+// waited on, and any change of holder is progress.
 const LOCK_STALE_MS = 10_000;
-const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 25;
+
+// Identity of the current holder, for telling "someone else took their turn"
+// from "the same process is still sitting here". Null when the lock is gone or
+// says nothing about who holds it.
+function lockHolder(lockPath) {
+  try {
+    const { pid, at } = JSON.parse(readFileSync(lockPath, 'utf8'));
+    return `${pid}:${at}`;
+  } catch {
+    return null;
+  }
+}
 
 function lockIsStale(lockPath) {
   let pid, at;
@@ -199,14 +218,18 @@ function lockIsStale(lockPath) {
     // there. Only the file's age can tell those apart.
     try { return Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { return false; }
   }
-  if (Date.now() - at > LOCK_STALE_MS) return true;
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
+  // Liveness first. A process that is gone is stale whatever the clock says, so
+  // a crashed holder is cleared on the next poll instead of after the window.
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); } catch (err) { if (err.code === 'ESRCH') return true; }
+  }
+  return Date.now() - at > LOCK_STALE_MS;
 }
 
 /** True when the lock is ours; false when we gave up and proceed without it. */
 async function acquireConfigLock(lockPath) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  let heldBy = null;
+  let heldSince = Date.now();
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx', 0o600);
@@ -222,8 +245,16 @@ async function acquireConfigLock(lockPath) {
       await unlink(lockPath).catch(() => {});
       continue;
     }
-    if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+    const holder = lockHolder(lockPath);
+    if (holder !== heldBy) {
+      // The queue advanced: a new holder gets its own budget.
+      heldBy = holder;
+      heldSince = Date.now();
+    } else if (Date.now() - heldSince > LOCK_STALE_MS * 2) {
+      // One holder, alive, past twice the staleness window without the stale
+      // rule firing: its clock disagrees with ours badly enough that waiting is
+      // no longer bounded by anything. Degrade rather than hang.
+      console.error(`[TeamClaude] ${lockPath} is still held by the same process after ${Date.now() - heldSince}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
