@@ -47,6 +47,12 @@ async function withRemoteProxy(run) {
         headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
       }),
+      // A path this proxy relays with the CLIENT's own headers instead of a
+      // pooled credential. On `/v1/messages` the account's token overwrites
+      // `Authorization` on its way out, which masks anything left in that slot;
+      // here nothing does, so it is the path that shows what the auth gate
+      // actually consumed.
+      relayRequest: headers => fetch(`http://127.0.0.1:${proxyPort}/v1/code/whoami`, { headers }),
       upstream: () => ({ authorization: upstreamAuthorization, requests: upstreamRequests }),
     });
   } finally {
@@ -152,4 +158,40 @@ test('a remote Upgrade authenticated by x-api-key preserves client Authorization
 
   assert.match(result.response, /101 Switching Protocols/);
   assert.deepEqual(result.upstream, { authorization: 'Bearer client-own-token', requests: 1 });
+});
+
+// A client can present the proxy credential BOTH ways round — an SDK that sets
+// `x-api-key` from config while a wrapper adds `Authorization` from the same
+// value. Authenticating on one and forwarding the other hands this proxy's own
+// key to upstream, and only the pooled routes would have hidden it: they
+// overwrite `Authorization` with the account's token, while a relay route
+// forwards the client's headers verbatim.
+test('a proxy key presented twice is consumed, not forwarded upstream', async () => {
+  await withRemoteProxy(async ({ relayRequest, upstream }) => {
+    const response = await relayRequest({
+      'x-api-key': 'sk-ant-oat-proxy-key',
+      authorization: 'Bearer sk-ant-oat-proxy-key',
+    });
+    await response.text();
+
+    assert.equal(response.status, 200);
+    assert.equal(upstream().requests, 1);
+    assert.equal(upstream().authorization, undefined, 'the proxy key must not reach upstream');
+  });
+});
+
+// The mirror case, which the consumption above must not break: a bearer that is
+// NOT the proxy key is the client's own upstream credential, and a relay route
+// exists precisely to carry it through untouched.
+test('a client-owned bearer still reaches upstream when x-api-key authenticated', async () => {
+  await withRemoteProxy(async ({ relayRequest, upstream }) => {
+    const response = await relayRequest({
+      'x-api-key': 'sk-ant-oat-proxy-key',
+      authorization: 'Bearer client-own-token',
+    });
+    await response.text();
+
+    assert.equal(response.status, 200);
+    assert.equal(upstream().authorization, 'Bearer client-own-token');
+  });
 });

@@ -222,10 +222,17 @@ export function resolveClientAuth(proxyConfig, presented) {
 // pooled account's own token in that slot.
 function authorizeBaseUrlClient(req, proxyConfig) {
   const bearerMatch = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  const bearerAuth = resolveClientAuth(proxyConfig, bearerMatch?.[1]);
+  // Consumed on the strength of the VALUE, not of who authenticated. A client
+  // that presents the proxy key BOTH ways round authenticates on `x-api-key`,
+  // and returning there early would leave `Authorization` in place — handing
+  // this proxy's own credential to upstream on every route that forwards the
+  // client's headers untouched (the WebSocket relay, the client-credential
+  // relay). Only the pooled paths would have masked it, by overwriting the
+  // header later with the account's own token.
+  if (bearerAuth.ok) delete req.headers.authorization;
   const headerAuth = resolveClientAuth(proxyConfig, req.headers['x-api-key']);
   if (headerAuth.ok) return headerAuth;
-  const bearerAuth = resolveClientAuth(proxyConfig, bearerMatch?.[1]);
-  if (bearerAuth.ok) delete req.headers.authorization;
   return bearerAuth;
 }
 
@@ -1388,8 +1395,11 @@ function relayStream(req, res, upstream, sx) {
  * because `server.on('upgrade')` is a different event that no part of
  * `requestHandler` runs for.
  *
- * `x-api-key` only. A browser cannot set that header on a WebSocket
- * handshake, so a browser client cannot authenticate here — deliberately.
+ * `x-api-key`, or the proxy key as `Authorization: Bearer` — the same two
+ * forms the request path accepts, since both gates call one helper and must
+ * not drift apart on who is admitted. A browser cannot set either header on a
+ * WebSocket handshake, so a browser client cannot authenticate here —
+ * deliberately.
  * The obvious alternative, reading the key out of `Sec-WebSocket-Protocol`,
  * is worse than not supporting browsers: relayUpgrade forwards that header to
  * the upstream (it strips `x-api-key`, which is the whole reason the
