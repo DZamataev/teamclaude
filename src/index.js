@@ -1347,7 +1347,14 @@ async function clientCommand() {
     const config = await loadOrCreateConfig();
     const entries = usableConfiguredClients(config.proxy?.clientKeys);
     if (!entries.length) {
-      console.log('No client keys configured.');
+      // Said plainly when the config HAS entries but none of them are usable:
+      // an empty key, a non-string, a blank name. The server ignores those
+      // too, so an operator reading "none configured" over a config file
+      // that visibly lists clients would go looking in the wrong place.
+      const present = Array.isArray(config.proxy?.clientKeys) ? config.proxy.clientKeys.length : 0;
+      console.log(present
+        ? `No usable client keys configured (${present} malformed ${present === 1 ? 'entry' : 'entries'} ignored).`
+        : 'No client keys configured.');
       return;
     }
     const showKeys = args[2] === '--show-keys';
@@ -1405,8 +1412,20 @@ async function clientCommand() {
         if (matches.some(entry => entry?.key === disk.proxy?.apiKey)) {
           throw clientCommandError(`Client "${sanitizeText(name)}" uses proxy.apiKey; that key would remain valid and become unattributed. Rotate or remove proxy.apiKey first.`);
         }
+        // The same reasoning one step further: a key this client shares with
+        // ANOTHER entry also survives the removal, so reporting a revocation
+        // would be just as untrue — the credential keeps working, merely
+        // attributed to the other name from now on. Refuse and say which name
+        // holds it, rather than leaving the operator believing a key they
+        // handed out has been withdrawn.
+        const survivors = entries.filter(entry => configuredClientName(entry?.name) !== name);
+        const shared = matches.find(entry => survivors.some(other => other?.key === entry?.key));
+        if (shared) {
+          const holder = survivors.find(other => other?.key === shared.key);
+          throw clientCommandError(`Client "${sanitizeText(name)}" shares its key with "${sanitizeText(configuredClientName(holder?.name))}"; that key would remain valid. Remove both, or rotate this client's key first.`);
+        }
         removed = matches.length;
-        disk.proxy.clientKeys = entries.filter(entry => configuredClientName(entry?.name) !== name);
+        disk.proxy.clientKeys = survivors;
       });
     } catch (err) {
       if (err?.clientCommand) clientUsageError(err.message);
@@ -2547,6 +2566,12 @@ async function notifyRunningServer(config, { strict = false, apiKey = config?.pr
     const res = await fetch(`http://localhost:${port}/teamclaude/reload`, {
       method: 'POST',
       headers: { 'x-api-key': apiKey },
+      // A listener that accepts the connection and then says nothing — a
+      // wedged server, a stale port claimed by something else — would
+      // otherwise hold a credential command open forever, with the key
+      // already written to disk and the operator with no idea whether the
+      // running server has it.
+      signal: AbortSignal.timeout(5_000),
     });
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
