@@ -5,6 +5,11 @@ import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// The staleness window from src/config.js's documented lock protocol. Restated
+// here rather than imported: this file is the protocol's test, so it should
+// fail if that constant moves without the contract being reconsidered.
+const LOCK_STALE_MS = 10_000;
+
 // The server (token refresh), the CLI (login/import/priority/...) and a GUI
 // client all rewrite the config with a temp+rename. Two of them racing keep only
 // the later write, and the edit that is lost is as likely as not a freshly
@@ -118,9 +123,10 @@ test('the lock is released after a success and after a throwing mutator', async 
   });
 });
 
-test('a lock that stays held past the 2 s budget is bypassed with one warning, and left in place', async () => {
+test('a lock held past the staleness window is taken over, and the write still lands', async () => {
   await withConfigDir(async ({ cfg, path, lockPath }) => {
-    // Fresh, and the pid is alive (ours): nothing lets a writer break it.
+    // Fresh, and the pid is alive (ours), so nothing lets a writer break it
+    // immediately — the liveness check says someone is working.
     const body = { pid: process.pid, at: Date.now() };
     await writeFile(lockPath, JSON.stringify(body));
     const warnings = [];
@@ -130,13 +136,20 @@ test('a lock that stays held past the 2 s budget is bypassed with one warning, a
       const started = Date.now();
       await cfg.saveConfig({ fresh: true });
       const waited = Date.now() - started;
-      assert.ok(waited >= 1900 && waited < 4000, `gave up at the budget, not before and not much after (waited ${waited}ms)`);
+      // The waiter sits through the staleness window rather than the old flat
+      // 2 s budget: a writer queued behind real work must not be failed for
+      // being second. Past that window the holder is stale by the documented
+      // rule and its turn is taken, so nothing hangs either.
+      assert.ok(
+        waited >= LOCK_STALE_MS * 0.9 && waited < LOCK_STALE_MS * 2,
+        `waited for the staleness window, not a flat budget (waited ${waited}ms)`,
+      );
     } finally {
       console.error = origError;
     }
     assert.deepEqual(await readJson(path), { fresh: true }, 'the write still landed');
-    assert.equal(warnings.length, 1, warnings.join('\n'));
-    assert.match(warnings[0], /teamclaude\.json\.lock is still held/);
-    assert.deepEqual(await readJson(lockPath), body, 'the other holder\'s lock was not touched');
+    // Taken over rather than bypassed: the write happened UNDER the lock, so a
+    // third writer arriving now queues behind it instead of racing it.
+    assert.deepEqual(warnings, [], 'a stale takeover is the normal path, not a warning');
   });
 });
