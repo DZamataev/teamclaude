@@ -211,10 +211,15 @@ test('renderStatus shows a client\'s WebSocket connections apart from its reques
   status.clients = {
     alice: { requests: 2, connections: 1, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
     bob: { requests: 1, connections: 0, inputTokens: 10, outputTokens: 5 },
+    charlie: { requests: 3, inputTokens: 30, outputTokens: 3 },
+    dana: { requests: 4, inputTokens: 40, outputTokens: 4 },
+    erin: { requests: 5, inputTokens: 50, outputTokens: 5 },
+    frank: { requests: 6, inputTokens: 60, outputTokens: 6 },
   };
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /alice\s+2 req, 1 ws, 1.0k in \/ 250 out, last 1m ago/);
   assert.match(output, /bob\s+1 req, 10 in \/ 5 out/, 'no channel, no column');
+  assert.match(output, /frank\s+6 req, 60 in \/ 6 out/, 'plain status remains unbounded');
 });
 
 test('renderStatus never grows a per-session section', () => {
@@ -508,4 +513,83 @@ test('renderStatus strips control characters out of account and route strings', 
   assert.match(output, /Blocked\s+custom/);
   assert.match(output, /pinned: a/);
   assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
+});
+
+// The Clients block's counters are lifetime totals; how many conversations a
+// machine is holding right now is a different question, and the one an operator
+// watching distribution is asking.
+test('renderStatus annotates each client row with its live session count', () => {
+  const status = sampleStatus();
+  status.clients = {
+    mbp: { requests: 100, inputTokens: 5000, outputTokens: 500, lastUsed: '2026-07-03T11:59:00Z' },
+    steamdeck: { requests: 10, inputTokens: 100, outputTokens: 10, lastUsed: '2026-07-03T11:55:00Z' },
+  };
+  status.sessions = {
+    active: 4, known: 5, distribute: true,
+    perClient: { mbp: { active: 3, known: 3 }, steamdeck: { active: 1, known: 2 } },
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /mbp\s+3 sess\s+100 req/);
+  // Idle but still remembered reads as 1/2, not as a bare 1 or a blank: "gone"
+  // and "idle inside the known window" are different states.
+  assert.match(output, /steamdeck\s+1\/2 sess\s+10 req/);
+});
+
+// A server that reports no per-client sessions (an older one, or a fleet where
+// every session came in on the shared key) must render exactly as before.
+test('renderStatus leaves client rows untouched when no session counts are reported', () => {
+  const status = sampleStatus();
+  status.clients = { mbp: { requests: 100, inputTokens: 5000, outputTokens: 500 } };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /mbp\s+100 req, 5.0k in \/ 500 out/);
+  assert.doesNotMatch(output, /sess/);
+});
+
+// Reading distribution means comparing accounts against each other, so the
+// account that was given nothing is the interesting row — it has to say so.
+test('renderStatus prints a zero session count on accounts once any account has sessions', () => {
+  const status = sampleStatus();
+  status.accounts = [
+    { ...status.accounts[0], name: 'a', sessions: 0 },
+    { ...status.accounts[0], name: 'b', sessions: 3 },
+  ];
+  status.sessions = { active: 3, known: 3, distribute: true };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /^> a .*\b0 sess/m);
+  assert.match(output, /^\s+b .*\b3 sess/m);
+});
+
+// With no sessions anywhere, a column of zeros is noise about a feature that is
+// not in play.
+test('renderStatus omits the session count entirely when no account has one', () => {
+  const status = sampleStatus();
+  const output = renderStatus(status, { color: false, now });
+
+  assert.doesNotMatch(output, /sess/);
+});
+
+// Ranking purely by lifetime tokens puts the machine that was busy yesterday
+// above the one running conversations right now, which is backwards for a
+// reader asking who is working. It also decides who survives truncation
+// wherever this block is capped.
+test('renderStatus ranks clients holding live sessions above idle heavier ones', () => {
+  const status = sampleStatus();
+  status.clients = {
+    heavy: { requests: 9999, inputTokens: 9_000_000, outputTokens: 900_000 },
+    light: { requests: 3, inputTokens: 10, outputTokens: 1 },
+  };
+  status.sessions = { active: 1, known: 1, perClient: { light: { active: 1, known: 1 } } };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.ok(
+    output.indexOf('light') < output.indexOf('heavy'),
+    'the client holding a live session is listed first',
+  );
 });
