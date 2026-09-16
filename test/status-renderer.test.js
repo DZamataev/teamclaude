@@ -593,3 +593,54 @@ test('renderStatus ranks clients holding live sessions above idle heavier ones',
     'the client holding a live session is listed first',
   );
 });
+
+// The status payload arrives over the wire, so the renderer cannot assume the
+// shapes its own tracker produces. Two separate hazards, both from reading a
+// row by a name that means something to a plain object.
+test('renderStatus reads a __proto__ client row by name, not by inheritance', () => {
+  const status = sampleStatus();
+  // Computed key: a bare `__proto__:` would set this literal's prototype.
+  status.clients = { ['__proto__']: { requests: 5, inputTokens: 10, outputTokens: 1 } };
+  status.sessions = { active: 1, known: 1, perClient: { ['__proto__']: { active: 1, known: 1 } } };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /__proto__\s+1 sess\s+5 req/);
+});
+
+// Counts that cannot exist must not be rendered as though they were measured.
+// `Number.isFinite` alone admits -3, and `-2/-1 sess` reports a fleet state
+// that is not merely wrong but impossible.
+test('renderStatus refuses negative and fractional session counts', () => {
+  const status = sampleStatus();
+  status.accounts = [
+    { ...status.accounts[0], name: 'a', sessions: -3 },
+    { ...status.accounts[0], name: 'b', sessions: 2 },
+  ];
+  status.clients = { x: { requests: 1, inputTokens: 1, outputTokens: 1 } };
+  status.sessions = { active: 2, known: 2, perClient: { x: { active: -2, known: 1.5 } } };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.doesNotMatch(output, /-\d+ sess/, 'no negative session count is printed');
+  assert.doesNotMatch(output, /\d+\.\d+ sess/, 'no fractional session count is printed');
+  assert.match(output, /^> a .*\b0 sess/m, 'an impossible count reads as none');
+});
+
+// Token totals arrive as JSON and may be strings. `+` concatenates those, so
+// "9" and "9" would sort as 99 while the same row renders 18 — an order that
+// disagrees with the numbers printed beside it.
+test('renderStatus sorts clients by numeric token totals, not string concatenation', () => {
+  const status = sampleStatus();
+  status.clients = {
+    stringy: { requests: 1, inputTokens: '9', outputTokens: '9' },
+    numeric: { requests: 1, inputTokens: 50, outputTokens: 0 },
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.ok(
+    output.indexOf('numeric') < output.indexOf('stringy'),
+    'the genuinely larger total is listed first',
+  );
+});

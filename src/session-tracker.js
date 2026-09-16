@@ -565,7 +565,13 @@ export class SessionTracker {
     // unlike the session ids it is summarising. An unattributed session (shared
     // key, or loopback exempt from the gate) has no name and is counted in
     // neither bucket, exactly as it appears in no Clients row.
-    const perClient = {};
+    // Null-prototype: a client named `__proto__` or `constructor` otherwise
+    // resolves the accumulator's INHERITED property instead of creating a row,
+    // so that client's sessions vanish from the report — and the increment
+    // lands on Object.prototype, corrupting every plain object in the process.
+    // Client names come from operator config, but a config file is not a
+    // reason to leave a prototype hole open.
+    const perClient = Object.create(null);
     const tokens = emptyAggregate();
     const byBucket = {};
     const items = detail ? [] : null;
