@@ -1859,6 +1859,26 @@ const SOCKET_TRANSIENT = new Set([
 // says nothing about that one, and failing over is correct.
 const HOST_TRANSIENT = new Set(['ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN']);
 
+// The subset of HOST_TRANSIENT that justifies writing OFF the other accounts on
+// that host for the rest of the request, rather than merely failing over away
+// from it. Skipping is a prediction about attempts not yet made, so it may only
+// carry codes whose answer will not differ a millisecond later:
+//
+//   ENOTFOUND     the name does not resolve
+//   EHOSTUNREACH  no route to that host
+//   ENETUNREACH   no route to that network
+//
+// EAI_AGAIN is deliberately absent. It is the resolver saying "temporary
+// failure, ask again" — one timed-out lookup is no evidence the next will fail,
+// and treating it as settled discards siblings that would have answered. It
+// still classifies as host-transient for the retry/failover decision above;
+// this is only about pre-emptively skipping accounts.
+//
+// ENETDOWN is absent for the opposite reason: the local interface being down is
+// not scoped to a hostname at all, so a different host cannot repair it and
+// there is nothing meaningful to skip.
+export const HOST_SETTLED = new Set(['ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH']);
+
 /**
  * Every error code a failure carries: its own, its `cause`'s, and its
  * children's. Node's global fetch puts the real error on `cause`, and the
@@ -2696,7 +2716,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // the same way. Mark them tried in one go rather than dialling a dead name
     // once per account — otherwise a fleet sharing one broken upstream spends a
     // full DNS timeout per sibling before reaching the account that can serve.
-    if (otherHostAvailable && errorCodes(err).some(code => HOST_TRANSIENT.has(code))) {
+    if (otherHostAvailable && errorCodes(err).some(code => HOST_SETTLED.has(code))) {
       for (const candidate of accountManager.accounts) {
         if (hostOf(candidate.upstream || upstream) === thisHost) ctx.tried.add(candidate.index);
       }

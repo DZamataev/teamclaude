@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, isTransientUpstreamError, HOST_SETTLED } from '../src/server.js';
 import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 
 function listen(server) {
@@ -123,5 +123,34 @@ test('a pinned account with a DNS failure reports pinned-unavailable instead of 
     assert.match(outcome.body, /pinned account is unavailable/i);
   } finally {
     proxy.close();
+  }
+});
+
+// Skipping an account is a prediction about an attempt not yet made, so the set
+// that triggers it must hold only codes whose answer cannot differ a moment
+// later. This is asserted on the set itself: an integration test can reach
+// ENOTFOUND through a real resolver, but not EAI_AGAIN, so narrowing the
+// condition to ENOTFOUND alone would otherwise leave every other code untested.
+test('only settled host failures write off an account, never a retryable one', () => {
+  // A resolver saying "temporary failure, try again" is the case that must NOT
+  // skip: one timed-out lookup is no evidence the next will fail, and the
+  // sibling discarded on that basis might have answered.
+  assert.equal(HOST_SETTLED.has('EAI_AGAIN'), false);
+  // The local interface being down is not scoped to a hostname at all, so
+  // there is no "other host" that skipping could usefully reach.
+  assert.equal(HOST_SETTLED.has('ENETDOWN'), false);
+
+  for (const settled of ['ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH']) {
+    assert.equal(HOST_SETTLED.has(settled), true, `${settled} is settled`);
+  }
+
+  // Every skip code must also be one the classifier already treats as
+  // host-scoped, or the two would disagree about what a host failure is.
+  for (const code of HOST_SETTLED) {
+    assert.equal(
+      isTransientUpstreamError(Object.assign(new Error('x'), { code }), { otherHostAvailable: false }),
+      true,
+      `${code} is host-transient to the classifier`,
+    );
   }
 });
