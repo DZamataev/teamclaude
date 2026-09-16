@@ -214,6 +214,21 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+// A base-URL client may present the proxy credential either way round: the
+// Anthropic SDKs send `x-api-key`, while OpenAI-shaped clients and anything
+// driving this proxy as a generic endpoint send `Authorization: Bearer`. A
+// matching bearer is consumed here — deleted from the headers — because it is
+// OUR credential, not the upstream's, and applyAuthHeaders is about to put the
+// pooled account's own token in that slot.
+function authorizeBaseUrlClient(req, proxyConfig) {
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  const headerAuth = resolveClientAuth(proxyConfig, req.headers['x-api-key']);
+  if (headerAuth.ok) return headerAuth;
+  const bearerAuth = resolveClientAuth(proxyConfig, bearerMatch?.[1]);
+  if (bearerAuth.ok) delete req.headers.authorization;
+  return bearerAuth;
+}
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
@@ -259,9 +274,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
-      const clientKey = req.headers['x-api-key'];
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
-      const auth = resolveClientAuth(config.proxy, clientKey);
+      const auth = authorizeBaseUrlClient(req, config.proxy);
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -1385,7 +1399,7 @@ function relayStream(req, res, upstream, sx) {
  * rather than answering it.
  */
 export function resolveUpgradeAuth(req, socket, proxyConfig) {
-  const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
+  const auth = authorizeBaseUrlClient(req, proxyConfig);
   if (auth.ok) return auth;
   // Loopback is exempt from the key requirement, exactly as the HTTP and
   // CONNECT gates are — with the request path's two conditions on top, for
