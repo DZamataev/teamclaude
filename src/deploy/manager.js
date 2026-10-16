@@ -29,6 +29,14 @@ import {
 } from './launcher.js';
 
 export const TEST_TIMEOUT_MS = 120_000;
+// The whole candidate suite, not one test. `node --test` is run serially below,
+// so this has to cover every file end to end on the machine being deployed to —
+// which is typically the smallest host in the fleet. The old budget was one
+// test's timeout plus 30s, and a suite that legitimately runs longer than that
+// was killed part way, surfacing as a score of files failing with "Promise
+// resolution is still pending but the event loop has already resolved" while
+// the failure count stayed at zero: a torn-down runner, not a broken release.
+export const SUITE_TIMEOUT_MS = 30 * 60_000;
 export const HEALTH_ATTEMPTS = 20;
 export const HEALTH_INTERVAL_MS = 1_000;
 
@@ -132,9 +140,16 @@ export function createDeployManager(dependencies = {}) {
   const uid = dependencies.uid ?? process.getuid?.();
 
   const runCandidateTests = dependencies.runCandidateTests || (async (candidate, nodePath) => {
-    const result = run(nodePath, ['--test', `--test-timeout=${TEST_TIMEOUT_MS}`], {
+    // Serially. `node --test` defaults to one worker per core and each worker is
+    // a full node process; on a small VPS running the live proxy that overcommits
+    // memory and the OOM killer starts choosing victims — including, observed on
+    // a 1GB host, the teamclaude service this deploy is supposed to be updating
+    // safely. A deploy must not be able to take down the thing it is deploying,
+    // so the verification step gives up wall-clock time to stay within the
+    // machine it runs on.
+    const result = run(nodePath, ['--test', '--test-concurrency=1', `--test-timeout=${TEST_TIMEOUT_MS}`], {
       cwd: candidate.path,
-      timeoutMs: TEST_TIMEOUT_MS + 30_000,
+      timeoutMs: SUITE_TIMEOUT_MS,
       stdio: 'inherit',
     });
     if (commandFailed(result)) throw new Error(`candidate tests exited ${result?.code ?? result?.status ?? 'unknown'}`);

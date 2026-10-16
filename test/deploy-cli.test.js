@@ -20,10 +20,15 @@ function streamPair(inputText = '', isTTY = true) {
   input.end(inputText);
   const output = new PassThrough();
   const stdout = new PassThrough();
+  const readAll = stream => {
+    const chunks = [];
+    for (let chunk = stream.read(); chunk !== null; chunk = stream.read()) chunks.push(chunk);
+    return Buffer.concat(chunks).toString();
+  };
   return {
     input, output, stdout,
-    errorText: () => output.read()?.toString() || '',
-    stdoutText: () => stdout.read()?.toString() || '',
+    errorText: () => readAll(output),
+    stdoutText: () => readAll(stdout),
   };
 }
 
