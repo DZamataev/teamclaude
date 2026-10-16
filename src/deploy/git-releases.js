@@ -5,6 +5,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 
 const COMMAND_TIMEOUT_MS = 120_000;
 
+/**
+ * @param {string} command
+ * @param {string[]} argv
+ * @param {any} [options]
+ */
 function defaultRun(command, argv, { cwd, timeoutMs = COMMAND_TIMEOUT_MS, stdio = 'pipe' } = {}) {
   const result = spawnSync(command, argv, {
     cwd,
@@ -67,6 +72,7 @@ function isBelow(parent, child) {
   return rel !== '' && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel);
 }
 
+/** @param {any} [options] */
 export function createGitReleaseStore({
   layout,
   run = defaultRun,

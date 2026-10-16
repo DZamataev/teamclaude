@@ -8,6 +8,11 @@ export const DEPLOYMENT_OWNER = 'teamclaude-git-deploy-v1';
 export const SERVICE_LABEL = 'com.karpeleslab.teamclaude';
 export const UNIT_NAME = 'teamclaude.service';
 
+/**
+ * @param {string} command
+ * @param {string[]} argv
+ * @param {any} [options]
+ */
 function defaultRun(command, argv, { stdio = 'pipe', timeoutMs = 30_000 } = {}) {
   const result = spawnSync(command, argv, { encoding: 'utf8', stdio, timeout: timeoutMs });
   return {
@@ -112,6 +117,7 @@ function below(parent, child) {
   return rel !== '' && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel);
 }
 
+/** @param {any} [options] */
 export function createDeployServiceAdapter({
   layout,
   run = defaultRun,

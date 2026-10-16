@@ -55,6 +55,7 @@ function defaultRun(command, argv, options = {}) {
   return { ...value, code: value.status };
 }
 
+/** @param {any} [options] */
 export function discoverBootstrap({
   execPath = process.execPath,
   nodeVersion = process.versions.node,
@@ -149,6 +150,7 @@ export function renderLauncher({ nodePath, entryPath }) {
   ].join('\n');
 }
 
+/** @param {any} options */
 export async function handoffLauncher({
   bootstrap,
   launcherPath,

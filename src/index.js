@@ -1994,7 +1994,7 @@ async function notifyClientMutation(config, apiKey) {
 }
 
 function clientCommandError(message) {
-  const error = new Error(message);
+  const error = /** @type {any} */ (new Error(message));
   error.clientCommand = true;
   return error;
 }

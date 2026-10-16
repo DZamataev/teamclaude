@@ -13,7 +13,7 @@ teamclaude deploy help
 `;
 
 function usageError(message) {
-  const error = new Error(message);
+  const error = /** @type {any} */ (new Error(message));
   error.exitCode = 64;
   return error;
 }

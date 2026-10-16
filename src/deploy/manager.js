@@ -40,6 +40,11 @@ export const SUITE_TIMEOUT_MS = 30 * 60_000;
 export const HEALTH_ATTEMPTS = 20;
 export const HEALTH_INTERVAL_MS = 1_000;
 
+/**
+ * @param {string} command
+ * @param {string[]} argv
+ * @param {any} [options]
+ */
 function defaultRun(command, argv, { cwd, timeoutMs = 30_000, stdio = 'pipe', env } = {}) {
   const result = spawnSync(command, argv, { cwd, encoding: 'utf8', timeout: timeoutMs, stdio, env });
   return {
@@ -342,6 +347,7 @@ export function createDeployManager(dependencies = {}) {
     };
   }
 
+  /** @returns {Promise<any>} */
   async function deployRef({ ref }) {
     const metadata = await requireMetadata();
     validateRequestedRef(ref);
@@ -368,6 +374,7 @@ export function createDeployManager(dependencies = {}) {
     };
   }
 
+  /** @returns {Promise<any>} */
   async function rollback() {
     const metadata = await requireMetadata();
     const originalSelection = await store.readSelection();
@@ -426,6 +433,7 @@ export function createDeployManager(dependencies = {}) {
     };
   }
 
+  /** @param {any} [options] */
   async function uninstall({ restoreNpm } = {}) {
     if (typeof restoreNpm !== 'boolean') {
       throw new Error('uninstall restoreNpm must be an explicit boolean');
