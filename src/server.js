@@ -148,7 +148,10 @@ export function isOAuthEntitlementDenied(body) {
 
 /** The account-level identity-verification hold: a 403 whose token is valid and
  * which names the portal the operator must visit. `null` for any other 403, so
- * the generic credential-refusal path keeps its wording. */
+ * the generic credential-refusal path keeps its wording.
+ * @param {any} body  the raw 403 body, as readErrorBody returns it
+ * @returns {{ url: string|null }|null}
+ */
 export function oauthVerificationHold(body) {
   try {
     const details = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details;
@@ -3029,6 +3032,8 @@ export async function peekStreamFailure(stream, bounds = {}) {
  * @param {{ accounts: Record<string, any>[] }} accountManager
  * @param {Set<string>} rejected  the refused accounts' names
  * @param {Map<string, number>|undefined} statuses  the status each one got
+ * @param {Map<string, string|null>|undefined} holds  the identity-verification
+ *   portal each held account pointed at
  */
 function refusalMessage(accountManager, rejected, statuses, holds) {
   const parts = [...rejected].map((name) => {
