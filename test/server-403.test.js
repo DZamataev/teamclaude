@@ -434,3 +434,42 @@ test('a caller-pinned request goes to exactly the account it targeted', async ()
     upstream.close();
   }
 });
+
+// Upstream's identity-verification hold answers 403 while the token stays valid,
+// and the portal link exists only in that response body. Telling the operator to
+// re-add the account sends them to a remedy that cannot work.
+test('a verification hold reports the portal link instead of a re-login', async () => {
+  const portal = 'https://portal.anthropic.com/verify?org=test-org';
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'permission_error',
+        message: "Your account can't receive replies from Claude right now.",
+        details: { error_code: 'verification_required', remediation_url: portal, capability: 'avocado' },
+      },
+      request_id: 'req_test',
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR }],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502);
+    assert.match(body, /identity verification/);
+    assert.ok(body.includes(portal), 'the portal link has to reach the operator');
+    assert.doesNotMatch(body, /teamclaude login/, 'a re-login cannot clear a verification hold');
+    assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'not an entitlement quarantine');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
