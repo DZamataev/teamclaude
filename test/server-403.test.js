@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, oauthVerificationHold } from '../src/server.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -472,4 +472,15 @@ test('a verification hold reports the portal link instead of a re-login', async 
     proxy.close();
     upstream.close();
   }
+});
+
+test('a verification hold keeps only an https remediation link', () => {
+  const hold = (/** @type {any} */ url) => oauthVerificationHold(Buffer.from(JSON.stringify({
+    error: { details: { error_code: 'verification_required', remediation_url: url } },
+  })));
+  assert.deepEqual(hold('https://portal.anthropic.com/verify?org=x'), { url: 'https://portal.anthropic.com/verify?org=x' });
+  assert.deepEqual(hold('javascript:alert(1)'), { url: null });
+  assert.deepEqual(hold('http://portal.anthropic.com/verify'), { url: null });
+  assert.deepEqual(hold('not a url\nforged log line'), { url: null });
+  assert.deepEqual(hold(42), { url: null });
 });

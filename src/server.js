@@ -156,7 +156,16 @@ export function oauthVerificationHold(body) {
   try {
     const details = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details;
     if (details?.error_code !== OAUTH_VERIFICATION_ERROR_CODE) return null;
-    return { url: typeof details.remediation_url === 'string' ? details.remediation_url : null };
+    // An alternate upstream is configurable, and this URL reaches the log and
+    // the client's 502: keep it only when it is a well-formed https link.
+    let url = null;
+    if (typeof details.remediation_url === 'string') {
+      try {
+        const parsed = new URL(details.remediation_url);
+        if (parsed.protocol === 'https:') url = parsed.href;
+      } catch { /* not a URL */ }
+    }
+    return { url };
   } catch {
     return null;
   }
