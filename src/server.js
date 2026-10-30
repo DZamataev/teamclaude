@@ -62,6 +62,7 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
+const OAUTH_VERIFICATION_ERROR_CODE = 'verification_required';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 
 /** Classify only the structured organization-policy denial observed upstream.
@@ -72,6 +73,19 @@ export function isOAuthEntitlementDenied(body) {
     return parsed?.error?.details?.error_code === OAUTH_ENTITLEMENT_ERROR_CODE;
   } catch {
     return false;
+  }
+}
+
+/** The account-level identity-verification hold: a 403 whose token is valid and
+ * which names the portal the operator must visit. `null` for any other 403, so
+ * the generic credential-refusal path keeps its wording. */
+export function oauthVerificationHold(body) {
+  try {
+    const details = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details;
+    if (details?.error_code !== OAUTH_VERIFICATION_ERROR_CODE) return null;
+    return { url: typeof details.remediation_url === 'string' ? details.remediation_url : null };
+  } catch {
+    return null;
   }
 }
 
@@ -2038,6 +2052,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // would turn a recoverable exhaustion into a hard error, and silently skip
     // the holdSeconds wait an unattended run depends on.
     const rejected = ctx.credentialRejected;
+    const held = ctx.verificationHold;
     const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
       ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
       : rejected.size === accountManager.accounts.length);
@@ -2047,7 +2062,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const allEntitlementDenied = entitlementDenied?.size === rejected.size
         && [...rejected].every(name => entitlementDenied.has(name));
       let message;
-      if (allEntitlementDenied && ctx.pinnedIndex != null) {
+      if (held?.size) {
+        // Neither a dead credential nor a quota window: the token is valid, so
+        // "re-add it" sends the operator the wrong way, and the portal link is
+        // the only actionable thing upstream tells us.
+        const urls = [...held.values()].filter(Boolean);
+        message = `Upstream requires identity verification for ${names}; the credential itself is valid, so re-adding it will not help.${urls.length ? ` Complete the verification at ${urls[0]}` : ' See the Anthropic Verification Portal.'}`;
+      } else if (allEntitlementDenied && ctx.pinnedIndex != null) {
         message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
@@ -2535,6 +2556,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const deniedUntil = entitlementDenied
         ? accountManager.markEntitlementDenied(account.index)
         : null;
+      const verification = account.type === 'oauth' && responseBody != null
+        ? oauthVerificationHold(responseBody)
+        : null;
+      if (verification) (ctx.verificationHold ??= new Map()).set(account.name, verification.url);
       // A set, not a name: the no-account branch needs to tell "every account was
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
@@ -2544,7 +2569,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
         : '';
-      console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
+      console.error(verification
+        ? `[TeamClaude] 403 on "${account.name}"; upstream requires identity verification, so the credential is valid and re-login will not help${verification.url ? ` — complete it at ${verification.url}` : ''}`
+        : `[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
