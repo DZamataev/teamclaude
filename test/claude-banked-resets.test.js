@@ -10,12 +10,8 @@ import { resetCreditTag } from '../src/tui.js';
 // offer, read off the same zero-spend usage probe and drawn through the same
 // surfaces the Codex reset credits already use.
 
-// Anchored to the clock, not to a calendar date: this fixture rotted. Once the
-// grant's absolute `ends_at` passed, every reading built from it returned 0 and
-// three tests below went red on their own, months after they were written.
 const DAY = 24 * 60 * 60 * 1000;
-const NOW = Date.now();
-const at = /** @param {number} ms */ ms => new Date(ms).toISOString();
+const NOW = Date.parse('2026-10-04T00:00:00Z');
 
 // The `cedar_ember` block taken from /api/oauth/usage?cedar_ember=1 on a live
 // Max account (2026-10-04). Grant `id`s and `next_grant_id` are deliberately
@@ -30,8 +26,8 @@ const LIVE_BLOCK = {
     label: 'Claude Opus 5.5 launch: one usage-limit reset for Pro and Max',
     resets_total: 1,
     resets_left: 1,
-    starts_at: at(NOW - 12 * DAY),
-    ends_at: at(NOW + 18 * DAY),
+    starts_at: '2026-09-22T16:00:00+00:00',
+    ends_at: '2026-10-22T16:00:00+00:00',
     clears: ['five_hour', 'seven_day', 'seven_day_overage_included'],
     paused: false,
     usable_now: true,
@@ -41,10 +37,10 @@ const LIVE_BLOCK = {
     arm: null,
   }],
   next_grant_id: 'next-grant-handle',
-  weekly_resets_at: at(NOW + 12 * 60 * 60 * 1000),
+  weekly_resets_at: '2026-10-04T12:00:00+00:00',
   cooldown_until: null,
 };
-const ENDS = NOW + 18 * DAY;
+const ENDS = Date.parse('2026-10-22T16:00:00+00:00');
 const grant = over => ({ ...LIVE_BLOCK.grants[0], ...over });
 
 // ── reading the block ───────────────────────────────────────────────────────
@@ -94,7 +90,7 @@ test('a grant held but not spendable yet counts as held, not applicable', () => 
 });
 
 test('several grants sum, and the soonest expiry is the one reported', () => {
-  const sooner = at(NOW + 6 * DAY);
+  const sooner = '2026-10-10T00:00:00+00:00';
   const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), grant({ ends_at: sooner, usable_now: false })] }, NOW);
   assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner) });
 });
