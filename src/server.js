@@ -26,6 +26,7 @@ import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames 
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
+import { isCliproxyPath, presentedManagementKey, serveCliproxyApi } from './cliproxy-api.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
@@ -304,9 +305,62 @@ export function shouldSynthesizeQuotaHeaders(config) {
   return /** @type {{ synthesizeQuotaHeaders?: unknown } | null | undefined} */ (config)?.synthesizeQuotaHeaders === true;
 }
 
+// Claude Code reads the unified quota headers as the state of the user's own
+// plan, and acts on them: past a warning threshold it shows limit warnings,
+// and once the 5-hour window nears its cap (95%, 99% on Max 5x, 99.75% on Max
+// 20x) it tells the model to checkpoint and stop starting long work. Behind a
+// pool those readings describe one account the proxy is about to rotate off,
+// so a session winds itself down while the pool still has quota.
+//
+// With `poolQuotaHeaders: true`, a successful response's client-bound copy
+// states the pool instead, as long as another account could still serve the
+// request: each window the upstream stated carries the lowest reading among
+// the accounts that could serve it, with that account's reset, its status
+// says `allowed`, and the warning-threshold and grace headers are dropped.
+// When the serving account is the last one left (poolQuotaReadings returns
+// null), its own headers pass through and Claude Code warns as it would
+// without the proxy. updateQuota has already run on the upstream headers.
+const POOLED_WINDOWS = /** @type {const} */ (['5h', '7d', '7d_oi']);
+const GRACE_HEADER_PREFIX = 'anthropic-ratelimit-unified-grace-';
+
 /**
- * The client-header flags a reload copies off the disk config, both sampled
- * per request through the two functions above.
+ * @param {Record<string, string>} headers  the client-bound copy, rewritten in place
+ * @param {Record<string, { utilization: number, resetAt: number }>} pool
+ */
+export function poolQuotaHeaders(headers, pool) {
+  const p = 'anthropic-ratelimit-unified-';
+  for (const w of POOLED_WINDOWS) {
+    delete headers[`${p}${w}-surpassed-threshold`];
+    if (headers[`${p}${w}-status`] !== undefined) headers[`${p}${w}-status`] = 'allowed';
+    if (headers[`${p}${w}-utilization`] === undefined) continue;
+    const reading = pool[w];
+    if (reading) {
+      headers[`${p}${w}-utilization`] = String(reading.utilization);
+      headers[`${p}${w}-reset`] = String(Math.floor(reading.resetAt / 1000));
+    } else {
+      // No candidate has read this window yet. Leaving the serving account's
+      // reading would restate the near-cap value this exists to hide.
+      delete headers[`${p}${w}-utilization`];
+      delete headers[`${p}${w}-reset`];
+    }
+  }
+  for (const key of Object.keys(headers)) {
+    if (key.startsWith(GRACE_HEADER_PREFIX)) delete headers[key];
+  }
+  if (headers[`${p}status`] === 'allowed_warning') headers[`${p}status`] = 'allowed';
+}
+
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldPoolQuotaHeaders(config) {
+  return /** @type {{ poolQuotaHeaders?: unknown } | null | undefined} */ (config)?.poolQuotaHeaders === true;
+}
+
+/**
+ * The client-header flags a reload copies off the disk config, each sampled
+ * per request through the functions above.
  *
  * @param {unknown} diskConfig
  */
@@ -314,6 +368,7 @@ export function reloadedHeaderFlags(diskConfig) {
   return {
     stripOverageHeaders: shouldStripOverageHeaders(diskConfig),
     synthesizeQuotaHeaders: shouldSynthesizeQuotaHeaders(diskConfig),
+    poolQuotaHeaders: shouldPoolQuotaHeaders(diskConfig),
   };
 }
 
@@ -390,12 +445,14 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
  * @param {string|undefined} remoteAddress
  * @param {Record<string, any>|undefined} proxyConfig
  * @param {string|null} [boundHost]  the address the server bound, when it is not `proxyConfig.host`
+ * @param {string} [endpoint]  what the refusal names; the CLIProxyAPI-compatible
+ *   usage API is held to the same rule
  * @returns {string|null}
  */
-export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null) {
+export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null, endpoint = 'the MCP endpoint') {
   if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
   if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
-    return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
+    return `request refused: with no proxy key configured ${endpoint} serves only this machine; set proxy.apiKey to reach it from elsewhere`;
   }
   // The address actually bound, when the caller knows it (TEAMCLAUDE_HOST can
   // differ from proxy.host — see createProxyServer's `bindHost`).
@@ -423,6 +480,20 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
 // Config arrays already checked for shape, so the warnings below fire once per
 // loaded list (a reload hands over a new array) rather than once per request.
 const checkedClientKeys = new WeakSet();
+// A clientKeys `scope`: absent (or "full") is every API route; "inference" is
+// the data plane only. Any other value cannot be read as "full", so it is
+// treated as "inference": a typo narrows a key, and the entry stays usable.
+// Dropping it instead would empty the list, and an empty list admits everyone.
+/** @param {unknown} scope */
+function knownClientKeyScope(scope) {
+  return scope === undefined || scope === 'full' || scope === 'inference';
+}
+
+/** @param {unknown} scope */
+function inferenceOnlyScope(scope) {
+  return scope !== undefined && scope !== 'full';
+}
+
 function usableClientKeys(clientKeys) {
   if (!checkedClientKeys.has(clientKeys)) {
     checkedClientKeys.add(clientKeys);
@@ -431,8 +502,13 @@ function usableClientKeys(clientKeys) {
       const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
       if (!name || !entry?.key) {
         console.error('[TeamClaude] proxy.clientKeys: an entry without a name and a key is ignored (usage is attributed by name)');
-      } else if (seen.has(name)) {
-        console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
+      } else {
+        if (!knownClientKeyScope(entry.scope)) {
+          console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
+        }
+        if (seen.has(name)) {
+          console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
+        }
       }
       seen.add(name);
     }
@@ -440,12 +516,19 @@ function usableClientKeys(clientKeys) {
   return clientKeys.filter(e => typeof e?.name === 'string' && e.name.trim() && e.key);
 }
 
+/**
+ * The identity a presented key authenticates as. `scope` is present only as
+ * "inference", for a clientKeys entry whose scope is anything other than
+ * absent or "full"; every other success has no scope field, so the result for
+ * existing keys is unchanged.
+ */
 export function resolveClientAuth(proxyConfig, presented) {
   const shared = proxyConfig?.apiKey;
   const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
   if (!shared && clientKeys.length === 0) return { ok: true, client: null };
   for (const entry of clientKeys) {
     if (safeKeyEqual(presented, entry.key)) {
+      if (inferenceOnlyScope(entry.scope)) return { ok: true, client: entry.name.trim(), scope: 'inference' };
       return { ok: true, client: entry.name.trim() };
     }
   }
@@ -465,6 +548,20 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
 ]);
 
+// What an inference-scoped key is refused: every route under the control
+// prefixes. The wildcard is what callerView reports for it.
+const INFERENCE_REFUSED_PATHS = ['/teamclaude/*'];
+
+// Whether a classified path belongs to the control plane, under either prefix.
+// Both the 404 catch-all and the inference-scope refusal ask this of
+// classificationPath(req.url), so an encoded spelling or the /teamrouter alias
+// is judged the same way everywhere.
+/** @param {string} path */
+function isControlPath(path) {
+  return path === '/teamclaude' || path.startsWith('/teamclaude/')
+    || path === '/teamrouter' || path.startsWith('/teamrouter/');
+}
+
 /**
  * The caller of /teamclaude/status as the control plane sees it, so the
  * dashboard can hide the controls this key would be refused instead of letting
@@ -472,11 +569,17 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * above, so the page and the gate cannot disagree. A key-less loopback caller
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
+ * An inference-scoped key is refused every control route, so its `refused` is
+ * the one wildcard entry for the whole /teamclaude/ prefix rather than a list
+ * that could fall behind the routes.
+ *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {string|null|undefined} [scope]  the key's scope from resolveClientAuth
+ * @returns {{ kind: 'operator'|'client', client: string|null, scope?: 'inference', refused: string[] }}
  */
-export function callerView(client) {
+export function callerView(client, scope) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
+  if (scope === 'inference') return { kind: 'client', client, scope, refused: [...INFERENCE_REFUSED_PATHS] };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
 }
 
@@ -546,7 +649,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
-      const clientKey = req.headers['x-api-key'];
+      // A CLIProxyAPI client sends its management key as a bearer (see
+      // cliproxy-api.js); on that API's paths alone it is read as the proxy key.
+      const cliproxyPath = isCliproxyPath(classificationPath(req.url));
+      const clientKey = req.headers['x-api-key'] ?? (cliproxyPath ? presentedManagementKey(req.headers) : undefined);
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {
@@ -583,6 +689,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           ok: false,
           error: 'cross-origin request refused: the control plane is not reachable from a web page',
         }));
+        return;
+      }
+
+      // An inference-scoped client key (proxy.clientKeys[].scope) is one of the
+      // operator's own agents or machines that should reach the model API and
+      // nothing else, so every control route is refused to it, before anything
+      // runs. Classified like the 404 catch-all below, so an encoded spelling or
+      // the /teamrouter alias is refused too. The dashboard page is served above
+      // the gate, and the data plane is not a control route, so both stay open.
+      if (auth.scope === 'inference' && isControlPath(classificationPath(req.url || ''))) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a client key scoped to inference cannot reach the control plane' }));
         return;
       }
 
@@ -654,7 +772,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -992,6 +1110,23 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // CLIProxyAPI-compatible usage API (cliproxy-api.js), off unless
+      // proxy.cliproxyApi says otherwise. Read-only and served from the quota
+      // already tracked, so a client key may read it as it may read status. A
+      // config with no key admits every caller, so it is held to this machine
+      // the way the MCP endpoint is. Every path under the prefix is answered
+      // here, on or off, so none falls through to the forwarder.
+      if (cliproxyPath) {
+        const refusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost(), 'the CLIProxyAPI-compatible usage API');
+        if (refusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: refusal }));
+          return;
+        }
+        await serveCliproxyApi(req, res, { accountManager, config, path: classificationPath(req.url), readBody: readControlBody });
+        return;
+      }
+
       // Every control route above matches an exact method and path, so a typo —
       // or just the wrong verb, `GET /teamclaude/reload` — fell through to the
       // forwarder: the request went upstream under a fleet account's credential
@@ -1002,8 +1137,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       const controlPath = classificationPath(req.url);
       // Both prefixes: an encoded spelling of the new one (`/%74eamrouter/`)
       // escapes the rewrite above and must not reach the forwarder either.
-      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')
-        || controlPath === '/teamrouter' || controlPath.startsWith('/teamrouter/')) {
+      if (isControlPath(controlPath)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
@@ -1081,6 +1215,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // socket has nothing else standing between a bad handshake and that exit.
   server.on('upgrade', (req, socket, head) => {
     try {
+      // The CLIProxyAPI prefix is ours, and no route under it is a WebSocket.
+      // requestHandler answers every request there itself; a handshake would
+      // otherwise be relayed with the client's management key in its headers
+      // (relayUpgrade strips only x-api-key). Refused before the key gate, as
+      // the request path's answer does not depend on the key either.
+      if (isCliproxyPath(classificationPath(req.url || ''))) {
+        try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
       // The upgrade handshake never reaches requestHandler, so it does not
       // inherit the key gate above — it has to ask for itself. Without this a
       // WebSocket handshake is an unauthenticated relay to `upstream`: the
@@ -1811,10 +1955,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -4205,6 +4349,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.synthesizeQuota === true && upstreamRes.status < 400
         && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
+    }
+
+    // The pool's headroom in place of the serving account's (see
+    // poolQuotaHeaders). An error response is left alone: a 429 that reaches
+    // the client is one rotation already failed to avoid. A pinned request is
+    // left alone too: rotation cannot move it, so its warnings are real.
+    if (ctx.poolQuota === true && ctx.pinnedIndex == null && upstreamRes.status < 400) {
+      const pool = accountManager.poolQuotaReadings(account, ctx.model, ctx.advisorModel, ctx.provider);
+      if (pool) poolQuotaHeaders(responseHeaders, pool);
     }
 
     res.writeHead(upstreamRes.status, responseHeaders);
