@@ -507,6 +507,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   }
 
+  const sendOauthUsage = (res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(oauthUsage(accountManager.getQuotaSummary()), null, 2));
+  };
+
   const requestHandler = async (req, res) => {
     try {
       // The control plane answers to its new name as well (issue #72): a URL
@@ -668,8 +673,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // reaches upstream. The CLI appends query flags (`cedar_ember`, `at_wall`,
       // `skip_spend`) that change nothing for us, so match on the path alone.
       if (req.method === 'GET' && classificationPath(req.url) === '/api/oauth/usage') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(oauthUsage(accountManager.getQuotaSummary()), null, 2));
+        sendOauthUsage(res);
         return;
       }
 
@@ -1553,6 +1557,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
+      }
+
+      // A pinned base URL (`ANTHROPIC_BASE_URL=…/tc-acct/<pin>`) only names the
+      // usage path once the pin above is stripped, so answer it here too, still
+      // before the credential relay that would fail upstream. This listener is a
+      // separate closure from createProxyServer, so it writes the reply itself.
+      if (req.method === 'GET' && classificationPath(req.url) === '/api/oauth/usage') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(oauthUsage(accountManager.getQuotaSummary()), null, 2));
+        return;
       }
 
       // Remote Control (/v1/code/*) is bound to the session's paired claude.ai

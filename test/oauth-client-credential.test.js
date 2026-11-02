@@ -45,9 +45,11 @@ const refusingManager = {
   getActiveAccount() { throw new Error('must not rotate an /api/oauth/* request'); },
 };
 
+// `/api/oauth/usage` is deliberately absent: the proxy answers it locally from
+// its own quota model, because the endpoint carries no identity and a relay
+// leaves the CLI with an upstream 401. See test/oauth-usage.test.js.
 for (const path of [
   '/api/oauth/profile',
-  '/api/oauth/usage',
   '/api/oauth/claude_cli/roles',
   '/api/oauth/files/abc',
   '/api/oauth/file_upload',

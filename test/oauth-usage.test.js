@@ -110,3 +110,52 @@ test('the usage route sits behind the same key gate as /teamclaude/quota', async
     proxy.close();
   }
 });
+
+test('a valid key reaches both routes through a forwarding proxy', async () => {
+  const am = { getQuotaSummary: () => SUMMARY };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' });
+  const port = await listen(proxy);
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    // The success path must not rest on the loopback exemption: valid keys are
+    // the only thing a remote deployment has, and they are easy to break.
+    const expected = oauthUsage(SUMMARY);
+    for (const path of ['/api/oauth/usage?cedar_ember=1', '/teamclaude/quota']) {
+      for (const headers of [
+        { 'x-forwarded-for': '203.0.113.7', 'x-api-key': 'secret' },
+        { 'x-forwarded-for': '203.0.113.7', authorization: 'Bearer secret' },
+      ]) {
+        const res = await fetch(`${origin}${path}`, { headers });
+        assert.equal(res.status, 200, `${path} ${JSON.stringify(Object.keys(headers))}`);
+        if (path.startsWith('/api/')) assert.deepEqual(await res.json(), expected, path);
+      }
+    }
+  } finally {
+    proxy.close();
+  }
+});
+
+test('a pinned base URL answers the usage route locally too', async () => {
+  const upstream = upstreamStub();
+  const upstreamPort = await listen(upstream.server);
+  // The deprecated /tc-acct/<pin> base URL reaches /api/oauth/usage only after
+  // the pin segment is stripped, so the route has to answer that shape as well.
+  const am = {
+    accounts: [{ name: 'pinned-account' }],
+    getQuotaSummary: () => SUMMARY,
+  };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    const res = await fetch(`${origin}/tc-acct/pinned-account/api/oauth/usage?at_wall=1`, {
+      headers: { 'x-forwarded-for': '203.0.113.7', 'x-api-key': 'secret' },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), oauthUsage(SUMMARY));
+    assert.equal(upstream.hits(), 0, 'a pinned usage request must not reach upstream');
+  } finally {
+    proxy.close();
+    upstream.server.close();
+  }
+});
