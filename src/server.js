@@ -24,6 +24,7 @@ import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
+import { oauthUsage } from './oauth-usage.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
@@ -656,6 +657,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const extra = hooks.getQuotaExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
+        return;
+      }
+
+      // The subscription usage Claude Code asks its configured base URL for.
+      // `/teamclaude/quota` is the proxy's own shape; the CLI only understands
+      // this endpoint, and with no route of ours it went upstream and came back
+      // 401 (that path carries the client's own credential, not a pooled one).
+      // Answered from the same fleet aggregate, so it costs nothing and never
+      // reaches upstream. The CLI appends query flags (`cedar_ember`, `at_wall`,
+      // `skip_spend`) that change nothing for us, so match on the path alone.
+      if (req.method === 'GET' && classificationPath(req.url) === '/api/oauth/usage') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(oauthUsage(accountManager.getQuotaSummary()), null, 2));
         return;
       }
 

@@ -22,6 +22,10 @@ curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/qu
 
 The optional quota probe also fills missing tier metadata on its first successful refresh. Tier metadata is persisted with observed quota in `teamclaude.state.json`, so it survives subsequent restarts.
 
+## Claude Code usage endpoint
+
+Claude Code's `/usage` reads `GET {ANTHROPIC_BASE_URL}/api/oauth/usage`, so the proxy answers that path itself from the same aggregates instead of forwarding it to Anthropic, which refuses it without an `x-api-key`. The reply is Anthropic's shape, not this proxy's: `five_hour` from the `fiveHour` aggregate, `seven_day` from `weeklyShared`, and `seven_day_sonnet` from `weeklySonnet`, with `utilization` as percentage used (0–100, not the 0–1 fraction the model stores) and `resets_at` as an ISO-8601 time. A window the aggregate does not know is omitted rather than reported as `0%`, and the Fable bucket has no field in that payload. The query flags the CLI appends (`cedar_ember`, `at_wall`, `skip_spend`) change nothing, and the same key gate as `/teamclaude/quota` applies.
+
 ## Quota probe
 
 If you'd rather keep idle accounts' quota fresh, enable the background probe:
